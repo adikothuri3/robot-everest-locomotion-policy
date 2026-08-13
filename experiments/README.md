@@ -11,7 +11,7 @@ config dump (holosoma writes `holosoma_config.yaml` per run), TensorBoard events
 | ID | Purpose | Command core | Status |
 | --- | --- | --- | --- |
 | E00 | Upstream repro (G1 FastSAC, validates install) | `exp:g1-29dof-fast-sac simulator:mjwarp --training.num_envs 512 --algo.config.num_learning_iterations 300` | run 2026-08-13 (see bootstrap report) |
-| E01 | A3 stand (pipeline sanity: zero-velocity commands dominate early training; also PD-stand floor via stability suite) | `exp:a3-ultra-fast-sac $IMPORT --training.num_envs 512 --algo.config.num_learning_iterations 1000` | smoke run 2026-08-13 |
+| E01 | A3 stand (pipeline sanity: zero-velocity commands dominate early training; also PD-stand floor via stability suite) | `exp:a3-ultra-fast-sac $IMPORT --training.num_envs 512 --algo.config.num_learning_iterations 200 --algo.config.logging_interval 10 --algo.config.save_interval 200` | run 2026-08-13 (`logs/everest-a3/20260813_233010`): GPU/WarpBackend, 0 nefc overflows, ~30 s/it wall-clock on this machine |
 | E02 | A3 flat walking, faithful upstream recipe | `exp:a3-ultra-fast-sac $IMPORT --training.num_envs 1024` (full iterations) | ready |
 | E03 | + moderate DR | same as E02 (upstream DR is already on; reduce/increase via `--randomization.*` overrides) | ready |
 | E04 | + push disturbances | upstream pushes are on by default; sweep `--randomization` push magnitude | ready |

@@ -16,6 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "imageio>=2.34"]
 train = ["torch>=2.6", "tensorboard>=2.16"]
+eval = ["onnxruntime>=1.18"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
