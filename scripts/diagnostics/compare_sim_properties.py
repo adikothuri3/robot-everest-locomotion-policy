@@ -37,11 +37,22 @@ def main() -> int:
         if abs(ra[0] - rb[0]) > TOL_RANGE or abs(ra[1] - rb[1]) > TOL_RANGE:
             issues.append(f"joint range {name}: {ra} vs {rb}")
 
+    # Per-body masses: the MJCF folds fixed zero-DOF child links (IMU housings,
+    # hand palms) into their parents while the URDF keeps them separate, so
+    # per-body mismatches where one sim has extra bodies are topology WARNINGS;
+    # total mass above is the hard conservation check.
     ba = {norm(k): v for k, v in a["bodies"].items()}
     bb = {norm(k): v for k, v in b["bodies"].items()}
+    topology_differs = set(ba) != set(bb)
+    warnings = []
     for name in sorted(set(ba) & set(bb)):
         if abs(ba[name]["mass"] - bb[name]["mass"]) > TOL_MASS:
-            issues.append(f"body mass {name}: {ba[name]['mass']:.4f} vs {bb[name]['mass']:.4f}")
+            msg = f"body mass {name}: {ba[name]['mass']:.4f} vs {bb[name]['mass']:.4f}"
+            (warnings if topology_differs else issues).append(msg)
+    if warnings:
+        print(f"{len(warnings)} per-body mass warnings (body sets differ; folded fixed links):")
+        for w in warnings:
+            print("  ~", w)
 
     print(f"compared {a['simulator']} vs {b['simulator']}")
     if issues:

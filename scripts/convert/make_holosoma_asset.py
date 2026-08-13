@@ -29,8 +29,66 @@ OUT_DIR = REPO / "assets" / "a3_ultra" / "holosoma"
 HEAD_JOINTS = {"head_yaw_joint", "head_pitch_joint"}
 FOOT_SOLE_POS = "0.04 0 -0.067"  # sole center in ankle_roll frame (= official foot site)
 
+# Bodies that keep a (primitive) collision geom in the training asset. The
+# official per-link MESH collisions overflow MJWarp's per-env constraint
+# allocation (nefc/njmax) and are slow; standard practice (cf. Holosoma's G1
+# asset) is primitive collisions. Feet keep the official 13 spheres per side.
+# These bodies cover termination/penalty contacts (pelvis/shoulder/hip) plus
+# common fall contacts (torso, thigh, shin, elbow).
+PRIMITIVE_COLLISION_BODIES = [
+    "pelvis_link",
+    "torso_Link",
+    "left_shoulder_roll_Link",
+    "right_shoulder_roll_Link",
+    "left_hip_yaw_Link",
+    "right_hip_yaw_Link",
+    "left_knee_Link",
+    "right_knee_Link",
+    "left_elbow_Link",
+    "right_elbow_Link",
+]
+
+
+def _collision_boxes_from_source() -> dict[str, list[dict]]:
+    """AABB-fit boxes to each target body's official collision-mesh geoms.
+
+    Uses MuJoCo's compiled geom_aabb (center + half-extents in geom frame) so
+    the primitive envelopes derive mechanically from the official meshes.
+    """
+    import mujoco
+    import numpy as np
+
+    m = mujoco.MjModel.from_xml_path(str(SRC_DIR / "mjcf" / "a3_ultra_t2d5.xml"))
+    boxes: dict[str, list[dict]] = {}
+    for body in PRIMITIVE_COLLISION_BODIES:
+        bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, body)
+        assert bid >= 0, f"body {body} not found in source model"
+        entries = []
+        for g in range(m.ngeom):
+            if m.geom_bodyid[g] != bid or m.geom_contype[g] == 0:
+                continue
+            if m.geom_type[g] != mujoco.mjtGeom.mjGEOM_MESH:
+                continue
+            center = m.geom_aabb[g][:3]
+            half = np.maximum(m.geom_aabb[g][3:], 0.005)
+            quat = m.geom_quat[g]
+            rot = np.zeros(9)
+            mujoco.mju_quat2Mat(rot, quat)
+            pos = m.geom_pos[g] + rot.reshape(3, 3) @ center
+            entries.append(
+                {
+                    "pos": " ".join(f"{v:.6f}" for v in pos),
+                    "quat": " ".join(f"{v:.6f}" for v in quat),
+                    "size": " ".join(f"{v:.6f}" for v in half),
+                }
+            )
+        assert entries, f"no collision mesh found on {body}"
+        boxes[body] = entries
+    return boxes
+
 
 def convert_mjcf() -> None:
+    collision_boxes = _collision_boxes_from_source()
     tree = ET.parse(SRC_DIR / "mjcf" / "a3_ultra_t2d5.xml")
     root = tree.getroot()
     root.set("model", "a3_ultra_29dof")
@@ -67,6 +125,30 @@ def convert_mjcf() -> None:
     for key in list(root.findall("keyframe")):
         root.remove(key)
 
+    # collision simplification: drop ALL mesh collision geoms; add AABB boxes
+    # on termination/contact bodies (feet keep their official sphere geoms).
+    n_removed = 0
+    for body in root.iter("body"):
+        for geom in list(body.findall("geom")):
+            if geom.get("class") == "collision" and geom.get("type") == "mesh":
+                body.remove(geom)
+                n_removed += 1
+        name = body.get("name", "")
+        if name in collision_boxes:
+            for i, bx in enumerate(collision_boxes[name]):
+                ET.SubElement(
+                    body,
+                    "geom",
+                    name=f"{name}_collision_box{i}",
+                    **{"class": "collision"},
+                    type="box",
+                    size=bx["size"],
+                    pos=bx["pos"],
+                    quat=bx["quat"],
+                )
+    print(f"collision simplification: removed {n_removed} mesh collision geoms, "
+          f"added {sum(len(v) for v in collision_boxes.values())} boxes")
+
     # add foot contact point bodies
     for body in root.iter("body"):
         name = body.get("name", "")
@@ -98,6 +180,25 @@ def convert_urdf() -> None:
                 for el in list(joint.findall(tag)):
                     joint.remove(el)
             n += 1
+
+    # The official URDF gives decorative shell/sensor links zero mass AND zero
+    # inertia; URDF importers (Isaac Sim) then auto-compute mass from mesh
+    # volume (the torso shell alone becomes ~18.6 kg). Stamp tiny valid
+    # inertials so importers keep the official 60.18 kg total.
+    n_zero = 0
+    for link in root.iter("link"):
+        ine = link.find("inertial")
+        if ine is None:
+            continue
+        if float(ine.find("mass").get("value")) == 0.0:
+            ine.find("mass").set("value", "1e-4")
+            inertia = ine.find("inertia")
+            for k in ("ixx", "iyy", "izz"):
+                inertia.set(k, "1e-7")
+            for k in ("ixy", "ixz", "iyz"):
+                inertia.set(k, "0")
+            n_zero += 1
+    print(f"URDF: stamped tiny inertials on {n_zero} zero-mass links")
     # mesh paths: point into local meshes/
     for mesh in root.iter("mesh"):
         f = mesh.get("filename")
@@ -119,7 +220,28 @@ def verify() -> None:
     assert mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "floating_base_joint") >= 0
     total = mujoco.mj_getTotalmass(m)
     assert abs(total - 60.1776) < 0.01, f"mass changed: {total}"
-    print(f"verify OK: 29 dof, 29 actuators, mass {total:.4f} kg, nbody={m.nbody}")
+
+    # no spurious self-contacts at the default crouch pose
+    d = mujoco.MjData(m)
+    d.qpos[2] = 1.07
+    d.qpos[3] = 1.0
+    crouch = {"hip_pitch": -0.2, "knee": 0.4, "ankle_pitch": -0.2}
+    for j in range(m.njnt):
+        name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, j) or ""
+        for key, val in crouch.items():
+            if key in name:
+                d.qpos[m.jnt_qposadr[j]] = val
+    mujoco.mj_forward(m, d)
+    floor = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    self_contacts = [
+        (mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, d.contact[c].geom1),
+         mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, d.contact[c].geom2))
+        for c in range(d.ncon)
+        if floor not in (d.contact[c].geom1, d.contact[c].geom2) and d.contact[c].dist < 0
+    ]
+    assert not self_contacts, f"spurious self-contacts at default pose: {self_contacts[:6]}"
+    print(f"verify OK: 29 dof, 29 actuators, mass {total:.4f} kg, nbody={m.nbody}, "
+          f"ncon@default={d.ncon}, no self-penetration")
 
 
 if __name__ == "__main__":

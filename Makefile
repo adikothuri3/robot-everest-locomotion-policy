@@ -4,19 +4,19 @@
 PY := .venv/Scripts/python.exe
 WSL := wsl -d Ubuntu-24.04 -- bash
 
-.PHONY: check-model find-pose convert-assets test train-a3 train-a3-smoke train-flat eval-stand eval-suite e00-smoke
+.PHONY: check-model check-isaac convert-assets test train-a3 train-a3-smoke train-a3-ppo eval-stand eval-suite
 
 check-model:        ## MuJoCo model diagnostics (12 PASS/FAIL checks)
 	$(PY) scripts/diagnostics/check_mujoco_model.py
+
+check-isaac:        ## Isaac Lab A3 validation (headless, needs .venv-isaac)
+	.venv-isaac/Scripts/python.exe scripts/diagnostics/check_isaac_a3.py
 
 convert-assets:     ## regenerate Holosoma 29-DOF A3 asset from official model
 	$(PY) scripts/convert/make_holosoma_asset.py
 
 test:               ## run the pytest suite
 	$(PY) -m pytest -q
-
-e00-smoke:          ## E00: upstream G1 FastSAC smoke run (validates install)
-	$(WSL) /tmp/e00.sh
 
 train-a3:           ## full A3 Ultra FastSAC training (WSL2/MJWarp)
 	$(WSL) scripts/train/train_a3_wsl.sh fastsac --training.num_envs 1024
