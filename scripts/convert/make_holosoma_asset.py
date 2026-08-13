@@ -154,6 +154,19 @@ def convert_mjcf() -> None:
     for key in list(root.findall("keyframe")):
         root.remove(key)
 
+    # contact solref: official 0.005 s is tuned for dt=0.001; Holosoma/MJWarp
+    # steps at dt=0.005, and MuJoCo requires timeconst >= 2*dt for stable
+    # contacts (G1's Holosoma asset uses 0.01). Relax to 0.01 everywhere.
+    n_solref = 0
+    for el in root.iter():
+        sr = el.get("solref")
+        if sr and sr.split()[0] == "0.005":
+            parts = sr.split()
+            parts[0] = "0.01"
+            el.set("solref", " ".join(parts))
+            n_solref += 1
+    print(f"solref relaxed 0.005 -> 0.01 on {n_solref} elements")
+
     # collision simplification: drop ALL mesh collision geoms; add AABB boxes
     # on termination/contact bodies (feet keep their official sphere geoms).
     n_removed = 0

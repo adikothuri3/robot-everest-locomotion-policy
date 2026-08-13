@@ -9,14 +9,14 @@
   </visual>
   <statistic extent="1.1" center="0 0 0.55" />
   <default>
-    <geom contype="0" conaffinity="0" friction="1 1" solref="0.005" />
+    <geom contype="0" conaffinity="0" friction="1 1" solref="0.01" />
     <default class="collision">
-      <geom group="3" contype="1" conaffinity="7" solref="0.005 1" friction="1 1" />
+      <geom group="3" contype="1" conaffinity="7" solref="0.01 1" friction="1 1" />
     </default>
     <default class="visual">
       <geom group="2" density="0" contype="0" conaffinity="0" />
     </default>
-    <equality solref="0.005" />
+    <equality solref="0.01" />
   </default>
   <asset>
     <texture type="skybox" name="skybox" builtin="gradient" mark="random" rgb1="0.2 0.3 0.4" rgb2="0 0 0" markrgb="1 1 1" random="0.001" width="1000" height="6000" />

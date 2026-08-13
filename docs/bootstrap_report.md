@@ -76,8 +76,10 @@ Decision matrix with weighted scoring: `docs/baseline_selection.md`.
    (`results/stability/pd_stand_baseline.json`): 25/68 survived; max recoverable
    push 0.2–0.3 m/s by direction; falls on rough terrain ≥0.4 difficulty and at
    friction 0.15 — the documented floor every trained policy must beat.
-5. Isaac Lab headless boot on this GPU (below min spec): boots; A3 URDF validation
-   via `scripts/diagnostics/check_isaac_a3.py` (see §10-addendum).
+5. Isaac Lab headless boot on this GPU (below min spec): boots; A3 URDF imports
+   through the Isaac Lab converter; **cross-sim property comparison PASSES**
+   (total mass conserved at 60.18 kg, all 29 joint limits within 0.002 rad —
+   after this comparator caught and we fixed the 19 kg zero-mass-link inflation).
 
 ## 9. Commands
 See README Quickstart and `experiments/README.md`. Core:

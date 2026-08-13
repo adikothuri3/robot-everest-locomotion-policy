@@ -57,6 +57,10 @@ Tolerances: 0.01 kg/body, 0.002 rad, 0.05 kg total.
    spheres (verified: no self-penetration at default pose, mass preserved).
 
 ## Status
-- MuJoCo-side dump complete (`results/consistency/mujoco.json`: 60.1796 kg, 29
-  actuated). Isaac-side re-dump with the fixed URDF in progress via
-  `scripts/diagnostics/check_isaac_a3.py`.
+- **2026-08-13: CONSISTENT within tolerances.** After the zero-mass-link fix,
+  `compare_sim_properties.py` reports total mass conserved (60.18 kg both
+  engines), all 29 actuated joints present with limits matching within
+  0.002 rad. Remaining warnings are the benign fold difference (item 2 above):
+  wrist_yaw (±hand palm), pelvis/torso (±IMU housings).
+- Dumps: `results/consistency/{mujoco,isaac}.json`; regenerate with the
+  commands above after any asset change.
