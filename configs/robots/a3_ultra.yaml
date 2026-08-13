@@ -1,0 +1,190 @@
+# =====================================================================
+# Canonical robot manifest: AgiBot A3 Ultra (T2.5 torso variant)
+# =====================================================================
+# SOURCE OF TRUTH for joint ordering, limits, and naming across ALL
+# simulators (MuJoCo, Isaac Lab, MJWarp/Holosoma). Any adapter MUST map
+# its internal ordering to/from `joint_order` below. Tests enforce this.
+#
+# Provenance:
+#   official : extracted programmatically from the official model repo
+#              https://github.com/AgibotTech/A3-A3U-robot-model
+#              commit 589f508ff357447c610a3f3004419035ddc8f153 (2026-08-06)
+#              files: a3_ultra_t2d5/mjcf/a3_ultra_t2d5.xml, urdf/model.urdf
+#              license: Mulan PSL v2 (permissive)
+#   assumed  : temporary simulation assumption chosen by this project;
+#              NOT a hardware spec. Every assumed value is marked.
+#
+# Variant note: a3_ultra_t3d0 adds dexterous hands (many finger DOF) and
+# renames head_pitch_joint -> ultra_head_pitch_joint. Locomotion uses
+# T2.5. The base A3 (a3_t2d5/a3_t3d0) shares limb topology; not yet
+# manifested.
+
+robot:
+  name: a3_ultra
+  variant: a3_ultra_t2d5
+  source_repo: https://github.com/AgibotTech/A3-A3U-robot-model
+  source_commit: 589f508ff357447c610a3f3004419035ddc8f153
+  license: MulanPSL-2.0
+  mjcf: third_party/A3-A3U-robot-model/a3_ultra_t2d5/mjcf/a3_ultra_t2d5.xml
+  urdf: third_party/A3-A3U-robot-model/a3_ultra_t2d5/urdf/model.urdf
+  total_mass_kg: 60.1776          # official (MJCF, computed by MuJoCo)
+  base_link: pelvis_link          # official (free joint root)
+  num_actuated_joints: 31         # official
+  num_bodies: 32                  # official (excl. world)
+
+# ---------------------------------------------------------------------
+# CANONICAL JOINT ORDER (official MJCF <actuator> order: legs L,R ->
+# waist -> arms L,R -> head). NOTE: the MJCF kinematic-tree joint order
+# differs (waist subtree first); never use tree order for obs/actions.
+# limits_rad: official. effort_nm: official (URDF effort == MJCF
+# actuatorfrcrange). vel_rad_s: official (URDF). damping / frictionloss:
+# official MJCF passive values.
+# ---------------------------------------------------------------------
+joint_order:
+  - left_hip_pitch_joint
+  - left_hip_roll_joint
+  - left_hip_yaw_joint
+  - left_knee_joint
+  - left_ankle_pitch_joint
+  - left_ankle_roll_joint
+  - right_hip_pitch_joint
+  - right_hip_roll_joint
+  - right_hip_yaw_joint
+  - right_knee_joint
+  - right_ankle_pitch_joint
+  - right_ankle_roll_joint
+  - waist_yaw_joint
+  - waist_roll_joint
+  - waist_pitch_joint
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_roll_joint
+  - left_wrist_pitch_joint
+  - left_wrist_yaw_joint
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_roll_joint
+  - right_wrist_pitch_joint
+  - right_wrist_yaw_joint
+  - head_yaw_joint
+  - head_pitch_joint
+
+joints:
+  left_hip_pitch_joint:    {limits_rad: [-2.5133, 2.9322], effort_nm: 220.0, vel_rad_s: 12.043, damping: 1.0, frictionloss: 1.1971}
+  left_hip_roll_joint:     {limits_rad: [-0.5236, 1.4835], effort_nm: 220.0, vel_rad_s: 12.043, damping: 1.0, frictionloss: 1.1971}
+  left_hip_yaw_joint:      {limits_rad: [-2.7227, 2.7227], effort_nm: 220.0, vel_rad_s: 12.043, damping: 1.0, frictionloss: 1.1971}
+  left_knee_joint:         {limits_rad: [-0.1222, 2.5307], effort_nm: 320.0, vel_rad_s: 14.661, damping: 2.0, frictionloss: 2.4276}
+  left_ankle_pitch_joint:  {limits_rad: [-0.9076, 0.5236], effort_nm: 118.2, vel_rad_s: 10.800, damping: 2.0, frictionloss: 1.4}
+  left_ankle_roll_joint:   {limits_rad: [-0.3491, 0.3491], effort_nm: 54.75, vel_rad_s: 19.370, damping: 2.0, frictionloss: 0.778}
+  right_hip_pitch_joint:   {limits_rad: [-2.5133, 2.9322], effort_nm: 220.0, vel_rad_s: 12.043, damping: 1.0, frictionloss: 1.1971}
+  right_hip_roll_joint:    {limits_rad: [-1.4835, 0.5236], effort_nm: 220.0, vel_rad_s: 12.043, damping: 1.0, frictionloss: 1.1971}
+  right_hip_yaw_joint:     {limits_rad: [-2.7227, 2.7227], effort_nm: 220.0, vel_rad_s: 12.043, damping: 1.0, frictionloss: 1.1971}
+  right_knee_joint:        {limits_rad: [-0.1222, 2.5307], effort_nm: 320.0, vel_rad_s: 14.661, damping: 2.0, frictionloss: 2.4276}
+  right_ankle_pitch_joint: {limits_rad: [-0.9076, 0.5236], effort_nm: 118.2, vel_rad_s: 10.800, damping: 2.0, frictionloss: 1.4}
+  right_ankle_roll_joint:  {limits_rad: [-0.3491, 0.3491], effort_nm: 54.75, vel_rad_s: 19.370, damping: 2.0, frictionloss: 0.778}
+  waist_yaw_joint:         {limits_rad: [-2.6180, 2.6180], effort_nm: 220.0, vel_rad_s: 12.043, damping: 1.0, frictionloss: 1.1971}
+  waist_roll_joint:        {limits_rad: [-0.3491, 0.3491], effort_nm: 46.0,  vel_rad_s: 22.700, damping: 0.5, frictionloss: 0.69223}
+  waist_pitch_joint:       {limits_rad: [-0.4887, 0.4189], effort_nm: 118.0, vel_rad_s: 9.248,  damping: 0.8, frictionloss: 1.7}
+  left_shoulder_pitch_joint:  {limits_rad: [-2.8798, 2.8798], effort_nm: 60.0, vel_rad_s: 13.614, damping: 1.5, frictionloss: 0.6293}
+  left_shoulder_roll_joint:   {limits_rad: [-0.0873, 2.6180], effort_nm: 60.0, vel_rad_s: 13.614, damping: 1.5, frictionloss: 0.6293}
+  left_shoulder_yaw_joint:    {limits_rad: [-2.7925, 2.7925], effort_nm: 24.0, vel_rad_s: 15.708, damping: 1.0, frictionloss: 0.41197}
+  left_elbow_joint:           {limits_rad: [-0.9599, 1.7453], effort_nm: 24.0, vel_rad_s: 15.708, damping: 1.0, frictionloss: 0.41197}
+  left_wrist_roll_joint:      {limits_rad: [-2.7925, 2.7925], effort_nm: 24.0, vel_rad_s: 15.708, damping: 1.0, frictionloss: 0.41197}
+  left_wrist_pitch_joint:     {limits_rad: [-1.6232, 1.6232], effort_nm: 6.0,  vel_rad_s: 12.776, damping: 1.0, frictionloss: 0.1}
+  left_wrist_yaw_joint:       {limits_rad: [-1.6232, 1.6232], effort_nm: 6.0,  vel_rad_s: 12.776, damping: 1.0, frictionloss: 0.1}
+  right_shoulder_pitch_joint: {limits_rad: [-2.8798, 2.8798], effort_nm: 60.0, vel_rad_s: 13.614, damping: 1.5, frictionloss: 0.6293}
+  right_shoulder_roll_joint:  {limits_rad: [-2.6180, 0.0873], effort_nm: 60.0, vel_rad_s: 13.614, damping: 1.5, frictionloss: 0.6293}
+  right_shoulder_yaw_joint:   {limits_rad: [-2.7925, 2.7925], effort_nm: 24.0, vel_rad_s: 15.708, damping: 1.0, frictionloss: 0.41197}
+  right_elbow_joint:          {limits_rad: [-0.9599, 1.7453], effort_nm: 24.0, vel_rad_s: 15.708, damping: 1.0, frictionloss: 0.41197}
+  right_wrist_roll_joint:     {limits_rad: [-2.7925, 2.7925], effort_nm: 24.0, vel_rad_s: 15.708, damping: 1.0, frictionloss: 0.41197}
+  right_wrist_pitch_joint:    {limits_rad: [-1.6232, 1.6232], effort_nm: 6.0,  vel_rad_s: 12.776, damping: 1.0, frictionloss: 0.1}
+  right_wrist_yaw_joint:      {limits_rad: [-1.6232, 1.6232], effort_nm: 6.0,  vel_rad_s: 12.776, damping: 1.0, frictionloss: 0.1}
+  head_yaw_joint:             {limits_rad: [-1.0472, 1.0472], effort_nm: 6.0,  vel_rad_s: 12.776, damping: 1.0, frictionloss: 0.1}
+  head_pitch_joint:           {limits_rad: [-0.4363, 0.2618], effort_nm: 6.0,  vel_rad_s: 12.776, damping: 1.0, frictionloss: 0.1}
+
+# ---------------------------------------------------------------------
+# Control subsets (project convention, not hardware):
+#   control_joints  : joints the locomotion policy commands.
+#   observation_joints: joints included in proprioceptive obs.
+# First baseline follows upstream practice (whole-body position targets
+# for legs+waist+arms; head frozen at default).
+# ---------------------------------------------------------------------
+control:
+  control_joints_mode: legs_waist_arms   # excludes head_yaw/head_pitch
+  frozen_joints: [head_yaw_joint, head_pitch_joint]
+  policy_frequency_hz: 50                # assumed (project choice; AgiBot X1 stack used 100 Hz)
+  sim_timestep_s: 0.001                  # official MJCF <option timestep>
+  decimation: 20                         # assumed (=1000/50)
+  action: joint_position_offset          # assumed (PD position targets, upstream-standard)
+  action_scale: 0.25                     # assumed, tune during port
+
+# PD gains: ASSUMED starting values for simulation only (MJCF ships
+# torque motors with no gains; no official PD spec published). Sized for
+# a 60 kg humanoid using Isaac Lab H1/G1 configs as prior art. Tune.
+pd_gains_assumed:
+  # RL-style gains (policies balance actively). NOTE: pure PD pose-hold
+  # standing is statically unstable with these — an inverted pendulum needs
+  # ankle-pitch stiffness > m*g*h_com ~ 530 Nm/rad. Diagnostics that require
+  # passive standing use a separate stiff "hold mode" (see
+  # scripts/diagnostics/check_mujoco_model.py); do not train with hold gains.
+  hip:            {kp: 200.0, kd: 5.0}
+  knee:           {kp: 200.0, kd: 5.0}
+  ankle:          {kp: 100.0, kd: 4.0}
+  waist:          {kp: 300.0, kd: 6.0}
+  shoulder:       {kp: 60.0,  kd: 2.0}
+  elbow:          {kp: 60.0,  kd: 2.0}
+  wrist:          {kp: 10.0,  kd: 0.5}
+  head:           {kp: 10.0,  kd: 0.5}
+  joint_pattern_map:   # regex -> group
+    ".*hip.*": hip
+    ".*knee.*": knee
+    ".*ankle.*": ankle
+    "waist.*": waist
+    ".*shoulder.*": shoulder
+    ".*elbow.*": elbow
+    ".*wrist.*": wrist
+    "head.*": head
+
+# ---------------------------------------------------------------------
+# Nominal standing pose: ASSUMED (slightly bent knees, arms relaxed).
+# The official MJCF keyframe is NOT a clean stand (captured off-nominal
+# pose) and is ignored. Validated by scripts/diagnostics/
+# check_mujoco_model.py settle test. Unlisted joints default to 0.
+# ---------------------------------------------------------------------
+default_pose:
+  # base_height_m: measured by FK: lowest contact geom at this crouch pose
+  # touches ground with pelvis at 1.063 m (straight-leg value: 1.076 m).
+  base_height_m: 1.063
+  joint_pos:
+    left_hip_pitch_joint: -0.2
+    left_knee_joint: 0.4
+    left_ankle_pitch_joint: -0.2
+    right_hip_pitch_joint: -0.2
+    right_knee_joint: 0.4
+    right_ankle_pitch_joint: -0.2
+    left_shoulder_roll_joint: 0.15
+    right_shoulder_roll_joint: -0.15
+    left_elbow_joint: 0.3
+    right_elbow_joint: 0.3
+
+# ---------------------------------------------------------------------
+# Bodies / contacts / sensors (official)
+# ---------------------------------------------------------------------
+bodies:
+  base: pelvis_link
+  torso: torso_Link
+  feet: [left_ankle_roll_Link, right_ankle_roll_Link]
+  knees: [left_knee_Link, right_knee_Link]
+  termination_contact_bodies: [pelvis_link, torso_Link]   # project convention
+  foot_sites: [left_foot, right_foot]      # site pos (0.04, 0, -0.067) in ankle_roll frame
+  foot_contact_geoms_per_foot: 13          # tiny spheres (r=0.002) outlining each sole
+  foot_length_m: 0.269                     # official geom span (x: -0.084..+0.185)
+  foot_width_m: 0.102                      # official geom span (y: ±0.051)
+
+sensors:
+  imu_sites: [imu_in_pelvis, imu_in_torso]  # official; pelvis IMU is primary
+  mjcf_provides: [jointpos, jointvel, jointactfrc, gyro, accelerometer, velocimeter, framepos, framequat, subtreeangmom]

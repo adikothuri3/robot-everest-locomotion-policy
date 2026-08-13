@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "everest-locomotion"
+version = "0.1.0"
+description = "AgiBot A3 Ultra locomotion RL for extreme stability and alpine terrain"
+requires-python = ">=3.11"
+dependencies = [
+    "mujoco>=3.11,<3.12",
+    "numpy>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "imageio>=2.34"]
+train = ["torch>=2.6", "tensorboard>=2.16"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
