@@ -72,9 +72,10 @@ Decision matrix with weighted scoring: `docs/baseline_selection.md`.
    smoke run **trains on GPU** (WarpBackend, CUDA graph, zero `nefc` overflows
    after the collision fix; ~28 s/iteration wall-clock — same rate as the G1
    upstream run on this machine, see §11).
-4. Stability suite on the PD-stand baseline: full metric pipeline incl. procedural
-   terrain injection (11/12 scenarios survived; rough-terrain fall expected for a
-   non-stepping baseline).
+4. Stability suite, full 68-scenario run on the PD-stand baseline
+   (`results/stability/pd_stand_baseline.json`): 25/68 survived; max recoverable
+   push 0.2–0.3 m/s by direction; falls on rough terrain ≥0.4 difficulty and at
+   friction 0.15 — the documented floor every trained policy must beat.
 5. Isaac Lab headless boot on this GPU (below min spec): boots; A3 URDF validation
    via `scripts/diagnostics/check_isaac_a3.py` (see §10-addendum).
 

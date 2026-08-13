@@ -49,6 +49,23 @@ PRIMITIVE_COLLISION_BODIES = [
 ]
 
 
+def _armature_for(joint: str) -> float:
+    """ASSUMED armature by actuator class; keep in sync with a3_ultra_presets."""
+    if "wrist_pitch" in joint or "wrist_yaw" in joint:
+        return 0.003
+    if any(k in joint for k in ("shoulder", "elbow", "wrist_roll")):
+        return 0.005
+    if "ankle" in joint or "waist_roll" in joint:
+        return 0.01
+    if "waist_pitch" in joint:
+        return 0.02
+    if any(k in joint for k in ("hip", "knee", "waist_yaw")):
+        return 0.025
+    if "head" in joint:
+        return 0.003
+    raise ValueError(f"no armature rule for {joint}")
+
+
 def _collision_boxes_from_source() -> dict[str, list[dict]]:
     """AABB-fit boxes to each target body's official collision-mesh geoms.
 
@@ -120,6 +137,18 @@ def convert_mjcf() -> None:
     for j in root.iter("joint"):
         if j.get("type") == "free":
             j.set("name", "floating_base_joint")
+
+    # per-joint armature (ASSUMED reflected rotor inertia; official MJCF ships
+    # none, but explicit software PD at 200 Hz is integration-unstable on the
+    # low-inertia distal joints without it — Holosoma's G1 asset sets it too).
+    # Values mirror _ARMATURE in holosoma_ext/a3_ultra_presets.py (test-checked).
+    n_arm = 0
+    for j in root.iter("joint"):
+        name = j.get("name", "")
+        if name.endswith("_joint") and j.get("type") != "free":
+            j.set("armature", f"{_armature_for(name)}")
+            n_arm += 1
+    print(f"armature set on {n_arm} joints")
 
     # drop stale keyframe
     for key in list(root.findall("keyframe")):
