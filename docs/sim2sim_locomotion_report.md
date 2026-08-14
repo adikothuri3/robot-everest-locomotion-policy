@@ -106,6 +106,58 @@ Linear velocity tracking is the strength; angular is the weak axis. If straight-
 heading hold matters downstream, that needs either a heading observation term or a
 heavier `tracking_ang_vel` weight on the next run.
 
+## Can an upper-body skill move the arms?
+
+The arms hang at the robot's sides in every clip because they are *policy-controlled*,
+not idle: the `pose` reward weights the 17 waist+arm joints at **50.0** against 0.01–5.0
+for the legs. A manipulation skill therefore does not add arm motion — it overrides 14 of
+the policy's 29 outputs. `scripts/eval/sim2sim_arms.py` measures what that costs: a
+scripted arm trajectory replaces the policy's arm targets across 7 motions × 4 contexts
+(stand, walk 0.5, walk 1.0, rough walk).
+
+**Result: 17/28 survive.** The failures are all *sustained* poses — reach-forward,
+overhead, asymmetric reach. Oscillatory motion is free: ±1.0 rad shoulder swings at
+1.5 Hz and continuous two-arm circling cost almost nothing.
+
+This is **not** a balance problem. The arms are 9.98 kg of the 60.18 kg robot, but the
+static CoM shifts are tiny against a 14.7 cm forward margin — reach-forward moves the CoM
+2.75 cm (19% of the margin) and overhead moves it 0.66 cm *backward*, yet both fall.
+
+The cause is the observation. Re-running with the arm `dof_pos`/`dof_vel` channels masked
+to default — the arms still physically move, the policy just cannot see them — gives
+**28/28**, with tilt back to 3–6° and tracking error back to baseline:
+
+| | arms visible to the policy | arm channels masked |
+| --- | --- | --- |
+| survived | 17/28 | **28/28** |
+| worst max tilt | 75.1° | 6.3° |
+| worst lin-vel error | 0.711 | 0.227 |
+
+The legs can carry the arm motion; the actor simply never saw a non-zero arm `dof_pos`
+during training (the pose reward pinned it there), so a large value on those 28 input
+dims behaves like an adversarial perturbation and corrupts the *leg* outputs. Tilt grows
+smoothly with amplitude (3.6° → 7.1° → 10.9° → 14.2° → fall), which is the signature of a
+progressively corrupted command rather than a mechanical limit.
+
+**Operating limits today, without masking** (held two-arm reach):
+
+| context | shoulder pitch only | pitch + elbow |
+| --- | --- | --- |
+| standing | ≤1.6 rad | ≤1.2 rad |
+| walking 0.5 m/s | ≤1.6 rad | ≤0.8 rad |
+
+Tolerance shrinks as more arm channels go off-distribution at once, which is why
+pitch 1.4 alone is fine but pitch 1.4 + elbow 0.9 falls.
+
+**What to do.** Masking the arm observation channels is free and needs no retraining, and
+is the right interim contract for a skill that owns the arms. It is not a guarantee: a
+masked policy is blind to the arms and can only react through body tilt, so high-momentum
+motion (throwing) or a payload in the hands may still break it — those were not tested.
+The principled fix is to retrain with randomized upper-body poses so those channels are
+in-distribution, and to drop the arm `pose` weights well below 50 so the policy is not
+punished for arm deviation in the first place. Holosoma already exposes `upper_dof_names`
+and `has_upper_body_dof` for exactly this.
+
 ## Checkpoint sweep
 
 All ten saved checkpoints (5 k → 50 k) survive the 7-scenario screen, and velocity

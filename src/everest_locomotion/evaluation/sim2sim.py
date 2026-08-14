@@ -386,6 +386,8 @@ class A3Sim:
         obs_noise: float = 0.0,
         seed: int = 0,
         spawn_yaw: float = 0.0,
+        target_override=None,
+        obs_transform=None,
         fall_tilt_deg: float = 70.0,
         fall_height_m: float = 0.45,
     ) -> RolloutResult:
@@ -422,6 +424,8 @@ class A3Sim:
             cmd = command.at(t)
 
             obs = self.observe(prev_action, step, cmd)
+            if obs_transform is not None:
+                obs = obs_transform(obs)
             if obs_noise > 0.0:
                 obs = obs + rng.uniform(-obs_noise, obs_noise, obs.shape)
             action = self.policy.act(obs)
@@ -431,6 +435,11 @@ class A3Sim:
             target = self.policy.default_dof_pos + self.policy.action_scale * np.clip(
                 action, -ACTION_CLIP_VALUE, ACTION_CLIP_VALUE
             )
+            if target_override is not None:
+                # An upper-body skill owning some joints: it replaces the policy's
+                # targets for them. The policy still sees the true dof_pos/dof_vel,
+                # so it observes what the skill did — it just cannot undo it.
+                target = target_override(target, t)
 
             while push_i < len(pushes) and t >= pushes[push_i].time_s:
                 self.data.qvel[0:3] += np.asarray(pushes[push_i].velocity_xyz)
