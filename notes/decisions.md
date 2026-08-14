@@ -22,7 +22,7 @@ PyPI mujoco-warp 3.11.0 produces diverging physics (NaN rewards, 1e12 angular ve
 
 ## 2026-08-13 — Generated primitive-collision training asset
 
-Official A3 mesh collisions overflow MJWarp's per-env constraint budget (`nefc overflow`). **Chosen:** a generated asset (`scripts/convert/make_holosoma_asset.py`): head welded → 29 DOF, mesh collisions → AABB-fitted boxes, foot contact points added, zero-mass URDF links stamped with tiny inertials (the Isaac importer had invented ~19 kg from mesh volumes — caught by the cross-sim comparator). v4 adds full-body collision boxes + lying keyframes for get-up. **Rule:** never hand-edit; regenerate.
+Official A3 mesh collisions overflow MJWarp's per-env constraint budget (`nefc overflow`). **Chosen:** a generated asset (`scripts/convert/make_holosoma_asset.py`): head welded → 29 DOF, mesh collisions → AABB-fitted boxes, foot contact points added, zero-mass URDF links stamped with tiny inertials (the Isaac importer had invented ~19 kg from mesh volumes — caught by the cross-sim comparator). v5 adds full-body collision boxes + lying keyframes for get-up (v4 = solref relax). **Rule:** never hand-edit; regenerate.
 
 ## 2026-08-13 — Baseline: Holosoma + FastSAC primary, Isaac Lab fallback
 

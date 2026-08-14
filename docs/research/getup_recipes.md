@@ -97,7 +97,7 @@ continuous gating is the eventual upgrade path.
 
 ## Porting surface & failure modes at 60 kg
 
-Robot-specific: asset + full-body primitive collisions (done, asset v4),
+Robot-specific: asset + full-body primitive collisions (done, asset v5),
 fallen-pose bank (done), PD gains under load (assumed values need get-up-phase
 validation), reward height targets rescaled, contact body names, torque budget
 asymmetry (arms weak → bias to leg-dominant strategies; waist pitch limit

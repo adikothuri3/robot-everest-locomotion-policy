@@ -24,18 +24,18 @@ config dump (holosoma writes `holosoma_config.yaml` per run), TensorBoard events
 
 ## Get-up ladder (mission: smooth self-recovery; plan in `docs/research/getup_recipes.md`)
 
-Asset v4 (full-body collision boxes + lying keyframes) and the fallen-pose bank
+Asset v5 (full-body collision boxes + lying keyframes) and the fallen-pose bank
 (`scripts/getup/generate_fallen_poses.py`) are prerequisites — done 2026-08-13.
-Note for E02+: v4 adds 16 collision boxes vs the E01 asset (26 total; locomotion
+Note for E02+: v5 adds 16 collision boxes vs the E01 asset (26 total; locomotion
 keeps self-collisions off so only vs-terrain pairs grow) and hip_pitch/hip_roll
 links are now contact-capable, so "hip" termination fires slightly earlier on
-falls. Watch nefc counters on the first v4 locomotion run
+falls. Watch nefc counters on the first v5 locomotion run
 (`contact_pairs_multiplier=16` in presets should still be ample).
 
 | ID | Purpose | Command core | Status |
 | --- | --- | --- | --- |
 | E11 | HoST feasibility probe: can 60 kg A3 rise at all? (throwaway, cloud GPU, Isaac Gym) | see `scripts/getup/host_probe/README.md` | scaffold ready; needs cloud GPU + Isaac Gym Preview 4 |
-| E12 | G1 get-up recipe parity in Holosoma (multi-critic + pull-force + β + L2C2 reimplemented; validate on G1 before A3) | new `getup` task via `$IMPORT`-style extension | blocked on E11 learnings + task implementation |
-| E13 | A3 flat get-up (supine/prone/side ≥90% rise in MJWarp; terminal = locomotion default_pose per manifest `getup.terminal`) | `exp:a3-ultra-getup $IMPORT` (to be registered) | blocked on E12 |
+| E12 | G1 get-up recipe parity in Holosoma (multi-critic + pull-force + β + L2C2 reimplemented; validate on G1 before A3) | new `getup` task via `$IMPORT`-style extension, `simulator:isaacsim` (MJWarp is NOT training-safe — NaNs under untrained flailing, and get-up is maximal flailing; MJWarp smoke runs only) | blocked on E11 learnings + task implementation |
+| E13 | A3 flat get-up (supine/prone/side ≥90% rise; terminal = locomotion default_pose per manifest `getup.terminal`) | `exp:a3-ultra-getup $IMPORT simulator:isaacsim` (to be registered), cloud via `scripts/cloud/train_a3_cloud.sh` | blocked on E12 |
 | E14 | Get-up→locomotion chained handoff in MuJoCo gate (get-up ONNX → freeze → locomotion ONNX, survive 5 s + 0.3 m/s command) | `scripts/eval/stability_suite.py` chained mode (to be added) | blocked on E13 + a trained locomotion policy (E02+) |
 | E15 | Slope/rough get-up curriculum (0–15°, HiFAR DR: μ→0.1, compliance, under-body obstacles) | E13 + terrain overrides | blocked on E13 |

@@ -1,0 +1,21 @@
+{
+  "model": "assets\\a3_ultra\\holosoma\\a3_ultra_29dof.xml",
+  "nq": 36,
+  "num_requested": 2048,
+  "seed": 0,
+  "drop_height_m": 0.5,
+  "rand_frac_of_range": 0.35,
+  "settle": {
+    "max_s": 10.0,
+    "min_s": 2.0,
+    "qvel_thresh": 0.05
+  },
+  "counts": {
+    "supine": 565,
+    "prone": 613,
+    "side_left": 435,
+    "side_right": 407
+  },
+  "unsettled_discarded": 28,
+  "qpos_layout": "0:3 base pos, 3:7 base quat wxyz, 7: 29 hinge joints in MJCF tree order"
+}
