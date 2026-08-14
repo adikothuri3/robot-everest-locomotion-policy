@@ -83,11 +83,27 @@ LYING_BASE_HEIGHT = 0.15       # reference "flat on ground" pelvis height
 STAND_GATE_HEIGHT = 0.80       # gates for final-stage rewards / assist cutoff
 UPRIGHT_GATE = -0.85           # projected gravity z when "upright enough"
 HOLD_STEPS = 100               # 2 s @ 50 Hz (manifest getup.terminal.hold_time_s)
-SUCCESS_HEIGHT = 0.90
+# Success gate == manifest getup.terminal (the handoff contract), NOT the
+# looser reward-shaping gate: pelvis 1.063±0.08, legs+waist mean pose error
+# <=0.30 rad, |v|<=0.25 m/s, leg/waist joint speeds <=1.0 rad/s. The assist
+# force anneals on THIS metric, so it can only reach zero on stands the
+# locomotion policy can actually take over from.
+SUCCESS_HEIGHT = 0.98
+SUCCESS_POSE_TOL = 0.30
+SUCCESS_LIN_VEL = 0.25
+SUCCESS_JOINT_VEL = 1.0
 MAX_ASSIST_FORCE_N = 350.0     # ~60% of 590 N weight (HoST heuristic)
 WRIST_ACTION_FACTOR = 0.2      # 0.25 * 0.2 = manifest wrist_action_scale 0.05
 POSES_DIR_DEFAULT = os.path.normpath(os.path.join(a3_ultra_presets.ASSET_ROOT, "..", "getup"))
 POSES_DIR = os.environ.get("EVEREST_A3_GETUP_POSES", POSES_DIR_DEFAULT)
+# Fail at import (seconds) rather than after the multi-minute IsaacSim scene
+# build: the pose bank is required by every use of this extension.
+if not os.path.isfile(os.path.join(POSES_DIR, "fallen_poses_meta.json")):
+    raise FileNotFoundError(
+        f"get-up pose bank not found at {POSES_DIR} — set EVEREST_A3_GETUP_POSES "
+        "(and EVEREST_A3_ASSET_ROOT) to this repo's assets/a3_ultra/getup, or "
+        "regenerate with scripts/getup/generate_fallen_poses.py"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -103,11 +119,14 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
     def _init_buffers(self):
         super()._init_buffers()
         n = self.num_envs
-        self.getup_assist_scale = 1.0  # annealed by GetupAssistCurriculum
+        # reset_all() re-runs _init_buffers AFTER load_checkpoint_state on
+        # resume — curriculum state must survive it, so only initialize once
+        if not hasattr(self, "getup_assist_scale"):
+            self.getup_assist_scale = 1.0  # annealed by GetupAssistCurriculum
+            self._success_rate = torch.tensor(0.0, device=self.device)
         self._assist_was_zero = False
         self._stand_hold_count = torch.zeros(n, dtype=torch.long, device=self.device)
         self._ever_success = torch.zeros(n, dtype=torch.bool, device=self.device)
-        self._success_rate = torch.tensor(0.0, device=self.device)
         self._getup_prev_dof_vel = torch.zeros(n, self.num_dof, device=self.device)
         self.getup_dof_acc = torch.zeros(n, self.num_dof, device=self.device)
         self._wrist_dof_idx = torch.tensor(
@@ -118,6 +137,31 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
         for i, name in enumerate(self.dof_names):
             if any(k in name for k in ("shoulder", "elbow", "wrist")):
                 self._arm_dof_mask[i] = 1.0
+        self._legs_waist_idx = torch.tensor(
+            [i for i, name in enumerate(self.dof_names)
+             if any(k in name for k in ("hip", "knee", "ankle", "waist"))],
+            dtype=torch.long, device=self.device,
+        )
+        # Per-dof limits mapped BY NAME into this backend's dof order.
+        # env.dof_vel_limits / torque_limits / dof_pos_limits are filled
+        # POSITIONALLY from the config lists by every holosoma backend, but the
+        # MuJoCo backend orders its dof arrays in MJCF TREE order (waist-first
+        # on the A3) while the config lists are canonical (legs-first) — so
+        # those tensors are scrambled there (upstream bug; harmless for G1
+        # whose tree order == config order; IsaacSim resolves by name and is
+        # unaffected). Never consume them; use these instead.
+        cfg = self.robot_config
+        order = [list(cfg.dof_names).index(n) for n in self.dof_names]
+        self.getup_dof_vel_limits = torch.tensor(
+            [cfg.dof_vel_limit_list[j] for j in order], device=self.device
+        )
+        self.getup_torque_limits = torch.tensor(
+            [cfg.dof_effort_limit_list[j] for j in order], device=self.device
+        )
+        self.getup_hard_pos_limits = torch.tensor(
+            [[cfg.dof_pos_lower_limit_list[j], cfg.dof_pos_upper_limit_list[j]] for j in order],
+            device=self.device,
+        )
         self._torso_body_idx = self.simulator.find_rigid_body_indice(
             self.robot_config.torso_name
         )
@@ -125,19 +169,32 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
     # -- per-step task state (runs before termination/reward on all backends) --
     def _pre_compute_observations_callback(self):
         super()._pre_compute_observations_callback()
+        # this callback also fires inside _refresh_envs_after_reset, i.e. twice
+        # on any step where an env resets — guard so hold counters / dof-acc
+        # update exactly once per sim step (else "held 2 s" silently halves)
+        if getattr(self, "_task_state_step", -1) == self.common_step_counter:
+            return
+        self._task_state_step = self.common_step_counter
         dt = self.dt
         self.getup_dof_acc[:] = (self.simulator.dof_vel - self._getup_prev_dof_vel) / dt
         self._getup_prev_dof_vel[:] = self.simulator.dof_vel
 
-        heights = self.terrain_manager.get_state("locomotion_terrain").base_heights
+        heights = getup_base_height(self)
         pg_z = get_projected_gravity(self)[:, 2]
         lin_vel = torch.norm(self.simulator.robot_root_states[:, 7:10], dim=-1)
         ang_vel = torch.norm(self.simulator.robot_root_states[:, 10:13], dim=-1)
+        lw = self._legs_waist_idx
+        pose_err = torch.mean(
+            torch.abs(self.simulator.dof_pos[:, lw] - self.default_dof_pos[:, lw]), dim=1
+        )
+        joint_speed = torch.amax(torch.abs(self.simulator.dof_vel[:, lw]), dim=1)
         standing = (
             (heights > SUCCESS_HEIGHT)
             & (pg_z < UPRIGHT_GATE)
-            & (lin_vel < 0.4)
+            & (lin_vel < SUCCESS_LIN_VEL)
             & (ang_vel < 0.8)
+            & (pose_err < SUCCESS_POSE_TOL)
+            & (joint_speed < SUCCESS_JOINT_VEL)
         )
         self._stand_hold_count = torch.where(
             standing, self._stand_hold_count + 1, torch.zeros_like(self._stand_hold_count)
@@ -194,7 +251,7 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
             return
         self._assist_was_zero = False
 
-        heights = self.terrain_manager.get_state("locomotion_terrain").base_heights
+        heights = getup_base_height(self)
         # help only while below the stand gate — assist must never hold the stand
         mask = (heights < STAND_GATE_HEIGHT).float()
         fz = mask * (scale * MAX_ASSIST_FORCE_N)  # [N]
@@ -339,10 +396,13 @@ class PoseBankCommand(CommandTermBase):
         easy = torch.rand(n, device=env.device) < float(env.getup_easy_start_prob)
         rows = torch.randint(0, self.num_poses, (n,), device=env.device)
 
-        # fallen states from the bank
+        # fallen states from the bank — clamp to HARD limits: env.dof_pos_limits
+        # is the 0.95-soft-scaled buffer, and settled poses legitimately rest at
+        # hard stops (arm pinned under torso); soft-clamping would spawn limbs
+        # displaced by up to 0.14 rad, interpenetrating the ground
         dof_pos = self.bank_dof_pos[rows]
         noise = (torch.rand_like(dof_pos) * 2 - 1) * self.joint_noise
-        limits = env.dof_pos_limits.to(env.device)
+        limits = env.getup_hard_pos_limits
         dof_pos = torch.clamp(dof_pos + noise, limits[:, 0], limits[:, 1])
         root_z = self.bank_root_z[rows]
         quat = self.bank_quat[rows]
@@ -358,7 +418,9 @@ class PoseBankCommand(CommandTermBase):
         env.simulator.dof_vel[env_ids] = 0.0
         rs = env.simulator.robot_root_states
         rs[env_ids, 0:2] = origins[:, 0:2]
-        rs[env_ids, 2] = origins[:, 2] + root_z
+        # +1 cm clearance: bank heights were settled in MuJoCo; PhysX collision
+        # geometry differs slightly and starting interpenetrated spikes contacts
+        rs[env_ids, 2] = origins[:, 2] + root_z + 0.01
         rs[env_ids, 3:7] = quat
         rs[env_ids, 7:13] = 0.0
 
@@ -413,6 +475,22 @@ class GetupAssistCurriculum(CurriculumTermBase):
 # ---------------------------------------------------------------------------
 # Reward terms
 # ---------------------------------------------------------------------------
+def getup_base_height(env) -> torch.Tensor:
+    """Pelvis height above the (flat) terrain, gimbal-safe.
+
+    NOT TerrainLocomotion.base_heights: that raycasts from points rotated by
+    quat_apply_yaw(base_quat), and yaw extraction normalizes [0,0,qz,qw] —
+    for lying orientations near prone-yawed-180° both components are ~0 and
+    the result is NaN, which poisons rewards/obs for those envs (observed in
+    validation smoke). Root z minus env-origin z is always finite and exact
+    on flat ground; for slope curricula (E15) switch to
+    terrain query_terrain_heights(xy), which never touches the base quat.
+    """
+    rs = env.simulator.robot_root_states
+    origins = env.terrain_manager.get_state("locomotion_terrain").env_origins
+    return rs[:, 2] - origins[:, 2]
+
+
 def task_upright(env) -> torch.Tensor:
     """0 when inverted, 1 when upright (dense righting signal)."""
     pg_z = get_projected_gravity(env)[:, 2]
@@ -421,12 +499,12 @@ def task_upright(env) -> torch.Tensor:
 
 def task_base_height(env, target: float = HEIGHT_TARGET, floor: float = LYING_BASE_HEIGHT) -> torch.Tensor:
     """0 lying -> 1 at target pelvis height (dense rising signal)."""
-    h = env.terrain_manager.get_state("locomotion_terrain").base_heights
+    h = getup_base_height(env)
     return torch.clamp((h - floor) / (target - floor), 0.0, 1.0)
 
 
 def _stand_gate(env) -> torch.Tensor:
-    h = env.terrain_manager.get_state("locomotion_terrain").base_heights
+    h = getup_base_height(env)
     pg_z = get_projected_gravity(env)[:, 2]
     return ((h > STAND_GATE_HEIGHT) & (pg_z < UPRIGHT_GATE)).float()
 
@@ -465,34 +543,50 @@ def penalty_dof_acc(env) -> torch.Tensor:
 def penalty_torques(env, arm_weight: float = 3.0) -> torch.Tensor:
     """Normalized torque penalty, arms weighted (24 Nm elbows on a 60 kg body)."""
     tau = env.action_manager.get_term("joint_control").torques
-    limits = env.torque_limits.to(env.device).flatten()
     w = 1.0 + (arm_weight - 1.0) * env._arm_dof_mask
-    return torch.sum(w * (tau / limits) ** 2, dim=1)
+    return torch.sum(w * (tau / env.getup_torque_limits) ** 2, dim=1)
 
 
 # ---------------------------------------------------------------------------
 # Termination terms (existing dof-limit terms are dead in manager envs)
 # ---------------------------------------------------------------------------
-def getup_dof_velocity_exceeded(env, tolerance: float = 1.25) -> torch.Tensor:
-    limits = env.dof_vel_limits.to(env.device).flatten()
-    return torch.any(torch.abs(env.simulator.dof_vel) > tolerance * limits, dim=1)
+def getup_dof_velocity_exceeded(env, tolerance: float = 25.0, grace_steps: int = 25) -> torch.Tensor:
+    """Anti-flail speed limit, with a reset grace window.
+
+    This is an insanity catch (25x limits ~ 300 rad/s on the hips = HoST's
+    own dof_vel_limit), NOT a smoothness constraint — penalties own smoothness.
+    Probe data drove the threshold: MJWarp's contact solver produces sustained
+    40-77 rad/s hip spikes (up to 10x limits) on lying robots under random
+    actions; anything tighter turns into a spawn-death loop that pins average
+    episode length at O(30) steps, keeps PenaltyCurriculum at min and success
+    at 0 forever. Real blowups (NaN precursors) exceed 300 rad/s by orders of
+    magnitude and the non-finite check below catches the rest. The grace
+    window additionally covers the PD snap toward default_dof_pos at reset.
+    """
+    over = torch.any(
+        torch.abs(env.simulator.dof_vel[:, :]) > tolerance * env.getup_dof_vel_limits, dim=1
+    )
+    return over & (env.episode_length_buf > grace_steps)
 
 
-def getup_base_velocity_exceeded(env, max_lin_vel: float = 4.0) -> torch.Tensor:
+def getup_base_velocity_exceeded(env, max_lin_vel: float = 10.0, grace_steps: int = 25) -> torch.Tensor:
     # non-finite catch is load-bearing: NaN states never trip a ">" comparison,
-    # so without it a single blown env poisons the whole PPO update
+    # so without it a single blown env poisons the whole PPO update.
+    # NaN check gets NO grace window — a blown env must die immediately.
     rs = env.simulator.robot_root_states
     state = rs[:, 0:13]  # slicing, not the raw view: MJWarp's MjwRootStateView is not a Tensor
     blown = torch.norm(state[:, 7:10], dim=-1) > max_lin_vel
+    blown = blown & (env.episode_length_buf > grace_steps)
     dof_vel = env.simulator.dof_vel[:, :]
-    return blown | ~torch.isfinite(state).all(dim=1) | ~torch.isfinite(dof_vel).all(dim=1)
+    nonfinite = ~torch.isfinite(state).all(dim=1) | ~torch.isfinite(dof_vel).all(dim=1)
+    return blown | nonfinite
 
 
 # ---------------------------------------------------------------------------
 # Observation term (critic-only privileged height)
 # ---------------------------------------------------------------------------
 def obs_base_height(env) -> torch.Tensor:
-    return env.terrain_manager.get_state("locomotion_terrain").base_heights.unsqueeze(1)
+    return getup_base_height(env).unsqueeze(1)
 
 
 # ---------------------------------------------------------------------------
@@ -566,10 +660,10 @@ getup_termination = TerminationManagerCfg(
         # hard speed limits double as anti-flail safety (HoST) — NO contact
         # termination: ground contact is the whole point of this task
         "dof_velocity": TerminationTermCfg(
-            func="everest_getup:getup_dof_velocity_exceeded", params={"tolerance": 1.25}
+            func="everest_getup:getup_dof_velocity_exceeded", params={"tolerance": 25.0}
         ),
         "base_velocity": TerminationTermCfg(
-            func="everest_getup:getup_base_velocity_exceeded", params={"max_lin_vel": 4.0}
+            func="everest_getup:getup_base_velocity_exceeded", params={"max_lin_vel": 10.0}
         ),
     }
 )

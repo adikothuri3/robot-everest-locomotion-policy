@@ -57,8 +57,10 @@ explicitly.
 # NOTE: install the pinned mujoco_warp first (scripts/setup/wsl_pin_mjwarp.sh)
 # — PyPI mujoco-warp 3.11.0 breaks physics
 wsl -d Ubuntu-24.04 -- env SIMULATOR=mjwarp bash scripts/train/train_a3_wsl.sh fastsac --training.num_envs 512
-# variants: ppo | fastsac; Everest stability reward: exp:a3-ultra-fast-sac-everest
+# tasks: fastsac | ppo | everest | getup | getup-fast-sac
 ```
+**Get-up** trains from the same stack: `bash scripts/cloud/train_a3_getup_cloud.sh`
+on the cloud box (`make train-getup-smoke` is the local wiring check only).
 
 ### 5. Evaluate stability
 ```powershell
@@ -79,13 +81,21 @@ src/everest_locomotion/
                                  (Tomasz's Everest generator plugs in here later)
   policies/                      Policy protocol; PDStand baseline; ONNX runner
   evaluation/rollout.py          metric-instrumented rollouts (slip, tilt, saturation...)
-  holosoma_ext/a3_ultra_presets.py  Holosoma --import-file: A3 robot + experiments
-assets/a3_ultra/holosoma/        generated 29-DOF training asset (head welded,
-                                 foot contact points added) — regenerate via
+  holosoma_ext/a3_ultra_presets.py  Holosoma --import-file: A3 robot + locomotion experiments
+  holosoma_ext/a3_ultra_getup.py    Holosoma --import-file: get-up task (env, rewards,
+                                 pose-bank resets, assist-force curriculum)
+assets/a3_ultra/holosoma/        generated 29-DOF training asset (MJCF + URDF, head
+                                 welded, foot contact points) — regenerate via
                                  scripts/convert/make_holosoma_asset.py
+assets/a3_ultra/getup/           fallen-pose bank (scripts/getup/generate_fallen_poses.py)
+scripts/cloud/                   turnkey Lambda/cloud runs: locomotion + get-up
 scripts/diagnostics/             model checks, cross-sim property dump/compare
 docs/                            environment, research, baseline decision, reports
 ```
+
+The two generated assets must describe the same robot — IsaacSim imports the
+URDF, MuJoCo reads the MJCF, and Holosoma asserts the body list matches the
+preset. `tests/test_asset_body_parity.py` fails if they drift.
 
 **Joint-order rule:** the manifest order is legs (L,R) → waist → arms (L,R) → head.
 The MJCF *kinematic tree* order differs — never index qpos directly; go through
@@ -99,9 +109,13 @@ default pose. Official MJCF/URDF from AgibotTech (Mulan PSL v2), pinned in
 presets directly reusable.
 
 ## Training ladder (planned experiments)
-E00 upstream repro → E01 stand → E02 flat walk → E03 +DR → E04 +pushes → E05 rough
-terrain → E06 Everest stability reward (`a3-ultra-fast-sac-everest`) → E07 PPO vs
-FastSAC → E08 cross-physics eval → E09 strong terrain+DR → E10 alpine curriculum.
+Locomotion: E00 upstream repro → E01 stand → E02 flat walk → E03 +DR → E04 +pushes
+→ E05 rough terrain → E06 Everest stability reward (`a3-ultra-fast-sac-everest`) →
+E07 PPO vs FastSAC → E08 cross-physics eval → E09 strong terrain+DR → E10 alpine
+curriculum.
+Get-up: E11 HoST feasibility probe → E12 get-up task in Holosoma
+(`a3-ultra-getup`) → E13 flat get-up cloud run → E14 chained get-up→locomotion
+handoff → E15 slope/rough get-up. Definitions and status: `experiments/README.md`.
 
 ## Sim-to-sim validation
 Train in IsaacSim/PhysX → evaluate in MuJoCo classic (`stability_suite.py`), the

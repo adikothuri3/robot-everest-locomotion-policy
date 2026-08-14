@@ -21,7 +21,8 @@ third_party/*/
 
 *.usd
 *.usda
-assets/**/converted/
+# holosoma's IsaacSim URDF->USD cache is written as converted_rank<N>/
+assets/**/converted*/
 
 .DS_Store
 Thumbs.db

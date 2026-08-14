@@ -4,7 +4,8 @@
 PY := .venv/Scripts/python.exe
 WSL := wsl -d Ubuntu-24.04 -- env
 
-.PHONY: check-isaac check-model convert-assets test train-a3 train-a3-smoke train-a3-ppo eval-stand eval-suite
+.PHONY: check-isaac check-model convert-assets test train-a3 train-a3-smoke train-a3-ppo \
+        train-getup-smoke fallen-poses eval-stand eval-suite
 
 check-isaac:        ## Isaac Lab / PhysX A3 validation — primary sim leg (needs .venv-isaac)
 	.venv-isaac/Scripts/python.exe scripts/diagnostics/check_isaac_a3.py
@@ -26,6 +27,17 @@ train-a3-smoke:     ## short local smoke run (MJWarp — smoke-only backend)
 
 train-a3-ppo:       ## A3 Ultra PPO arm (E07 comparison, IsaacSim)
 	$(WSL) bash scripts/train/train_a3_wsl.sh ppo --training.num_envs 1024
+
+# NOTE: `simulator:mjwarp` replaces the whole simulator preset, so the get-up
+# task's 10 s episode length (set on the isaacsim preset) must be re-passed here.
+train-getup-smoke:  ## short local get-up wiring check (MJWarp; real runs = train_a3_getup_cloud.sh)
+	$(WSL) SIMULATOR=mjwarp bash scripts/train/train_a3_wsl.sh getup-fast-sac \
+	  --training.num_envs 64 --algo.config.num_learning_iterations 5 \
+	  --simulator.config.sim.max_episode_length_s 10 \
+	  --simulator.config.mujoco_warp.njmax_per_env 1024
+
+fallen-poses:       ## regenerate the get-up fallen-pose bank (assets/a3_ultra/getup)
+	$(PY) scripts/getup/generate_fallen_poses.py
 
 eval-stand:         ## stability suite on the PD-stand baseline (pipeline check)
 	$(PY) scripts/eval/stability_suite.py --policy stand

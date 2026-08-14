@@ -40,10 +40,17 @@ smoke-tested but not training-validated upstream, and we reproduced
 deterministic physics NaNs under untrained-policy flailing on MJWarp with the
 upstream G1 asset (pinned versions, 2026-08-13; A3 ruled out by control
 experiment; best MJWarp combo found — mujoco 3.11.0 + mujoco_warp `ecaef88` +
-warp-lang 1.15.0 — still NaNs by ~step 85). The A3 config needs no changes for
-IsaacSim: the backend auto-converts our URDF (already validated in Isaac Lab —
-limits/masses match, see `docs/simulator_consistency.md`).
+warp-lang 1.15.0 — still NaNs by ~step 85).
 Use `SIMULATOR=mjwarp` only for short smoke runs.
+
+The IsaacSim backend imports the **URDF** (`usd_file=None` → dynamic URDF→USD
+conversion) and then asserts that the articulation's body list equals the
+preset's `body_names`. The generated URDF is built to satisfy exactly that —
+34 links, contact-point links present, no decorative links (see
+`scripts/convert/make_holosoma_asset.py` and `tests/test_asset_body_parity.py`,
+which fails the build if the two assets ever drift). Pre-flight it locally with
+`make check-isaac`, which imports the URDF with the same converter settings
+Holosoma uses.
 
 ## Which experiment
 1. **`a3-ultra-fast-sac` (default)** — upstream FastSAC sim-to-real recipe with

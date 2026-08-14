@@ -117,6 +117,11 @@ control:
   control_joints_mode: legs_waist_arms   # excludes head_yaw/head_pitch
   frozen_joints: [head_yaw_joint, head_pitch_joint]
   policy_frequency_hz: 50                # assumed (project choice; AgiBot X1 stack used 100 Hz)
+  # These two describe the MuJoCo-classic EVALUATION stack (evaluation/rollout.py),
+  # which deliberately integrates finer than training. Holosoma trains at
+  # sim fps 200 / control_decimation 4 (SimEngineConfig) — a different substep
+  # but the SAME 50 Hz policy rate, which is what the policy interface fixes.
+  # Do not "sync" these values to the trainer; change policy_frequency_hz only.
   sim_timestep_s: 0.001                  # official MJCF <option timestep>
   decimation: 20                         # assumed (=1000/50)
   action: joint_position_offset          # assumed (PD position targets, upstream-standard)

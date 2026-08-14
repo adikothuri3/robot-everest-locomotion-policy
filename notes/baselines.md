@@ -26,7 +26,7 @@ What this project is built on, what it is deliberately **not**, and the measured
 ## Single sources of truth
 
 - **Robot truth:** `configs/robots/a3_ultra.yaml` — joint order legs (L,R) → waist → arms (L,R) → head; official vs ASSUMED values (PD gains, armature, default pose) explicitly separated.
-- **Training asset:** `assets/a3_ultra/holosoma/a3_ultra_29dof.xml` is **generated** by `scripts/convert/make_holosoma_asset.py` (v4: full-body primitive collision boxes, lying keyframes). Never edit by hand; regenerate.
+- **Training asset:** the MJCF *and* the URDF in `assets/a3_ultra/holosoma/` are both **generated** by `scripts/convert/make_holosoma_asset.py` and must stay one robot — IsaacSim imports the URDF, MuJoCo/MJWarp reads the MJCF, and Holosoma asserts the body list equals the preset's `body_names`. Full-body primitive collisions, lying keyframes, 34 bodies in both files. Never edit by hand; regenerate. `tests/test_asset_body_parity.py` fails on drift. Version history: [[decisions]].
 - **Default simulator:** `isaacsim`. Anything that runs MJWarp must pass `simulator:mjwarp` (or `SIMULATOR=mjwarp`) explicitly and is a smoke run by definition.
 - **Critical pin (MJWarp path only):** mujoco_warp git `ecaef88` (3.10.0) with holosoma `6e146b0`. PyPI mujoco-warp 3.11.0 **breaks physics** (NaN, 1e12 velocities) — see [[setup]].
 
@@ -36,5 +36,5 @@ What this project is built on, what it is deliberately **not**, and the measured
 | --- | --- | --- |
 | PD-stand stability suite | 25/68 scenarios survived; max recoverable push 0.2–0.3 m/s; falls at terrain difficulty ≥0.4 and friction 0.15 | `results/stability/pd_stand_baseline.json` |
 | MuJoCo model diagnostics | 12/12 PASS (settle, contacts, penetration <0.1 mm, 0.15 m/s push) | `scripts/diagnostics/check_mujoco_model.py` |
-| Cross-sim consistency (MuJoCo vs Isaac) | PASS at asset v4 | `docs/simulator_consistency.md` |
+| Cross-sim consistency (MuJoCo vs Isaac) | PASS when recorded; **needs re-running** — the URDF was rebuilt after that run (`make check-isaac`) | `docs/simulator_consistency.md` |
 | E00/E01 training smoke | GPU WarpBackend, 0 nefc overflows, ~30 s/it locally | [[experiments]] |

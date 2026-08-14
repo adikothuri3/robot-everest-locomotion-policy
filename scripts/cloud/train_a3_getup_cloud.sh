@@ -28,12 +28,15 @@
 # [isaacgym, isaacsim]; MJWarp NaNs under untrained-policy flailing and get-up
 # is maximal flailing. (Local MJWarp = smoke tests only.)
 #
-# Watch during training (TensorBoard: logs/everest-a3/<run>/):
-#   Episode/getup_success_rate  -> the metric that matters (target: >0.9)
-#   Episode/getup_assist_scale  -> must anneal 1.0 -> 0.0 (success without
-#                                  assist is the only success that counts)
-#   Episode/penalty_scale       -> smoothness ramp (0.1 -> 1.0)
-#   average_episode_length      -> ~500 (=10 s) once flailing stops
+# Watch during training (TensorBoard: logs/everest-a3/<run>/; env log_dict
+# tags are logged WITHOUT a prefix):
+#   getup_success_rate     -> the metric that matters (target: >0.9); success
+#                             gate == manifest getup.terminal handoff contract
+#   getup_assist_scale     -> must anneal 1.0 -> 0.0 (success without assist
+#                             is the only success that counts)
+#   penalty_scale          -> smoothness ramp (0.1 -> 1.0)
+#   average_episode_length -> must start near ~500 (=10 s), NOT ~10 (if it
+#                             pins low, envs are dying at spawn — abort)
 # A policy is only DONE when: success_rate > 0.9 AND assist_scale == 0.0
 # AND penalty_scale == 1.0.
 # =============================================================================
@@ -41,7 +44,9 @@ set -euo pipefail
 
 EXP="${EXP:-a3-ultra-getup}"
 NUM_ENVS="${NUM_ENVS:-4096}"
-ITERATIONS="${ITERATIONS:-20000}"
+# Iteration budgets differ per algo (FastSAC counts differently than PPO):
+# only override the experiment's registered default if ITERATIONS is set.
+ITERATIONS="${ITERATIONS:-}"
 SEED="${SEED:-1}"
 HOLOSOMA_COMMIT="6e146b0af5d7cd8a39b8bb2ed05b977cf70445d3"
 
@@ -76,19 +81,11 @@ git -C "$WORK/holosoma" checkout -q "$HOLOSOMA_COMMIT"
 cd "$WORK/holosoma"
 
 echo "== [3/6] IsaacSim environment (conda env hssim) =="
-if ! command -v conda >/dev/null; then
-  echo "installing Miniforge..."
-  curl -fsSL -o /tmp/miniforge.sh \
-    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
-  bash /tmp/miniforge.sh -b -p "$HOME/miniforge3"
-  # shellcheck disable=SC1091
-  source "$HOME/miniforge3/etc/profile.d/conda.sh"
-  conda init bash >/dev/null
-else
-  CONDA_BASE=$(conda info --base)
-  # shellcheck disable=SC1091
-  source "$CONDA_BASE/etc/profile.d/conda.sh"
-fi
+# setup_isaacsim.sh installs its OWN miniconda under $HOME/.holosoma_deps
+# (scripts/source_common.sh) and creates `hssim` there; it is idempotent via
+# $HOME/.holosoma_deps/.env_setup_finished_hssim. Do not bootstrap a second
+# conda — source_isaacsim_setup.sh activates from holosoma's CONDA_ROOT
+# regardless of what is on PATH. (Same as scripts/cloud/train_a3_cloud.sh.)
 bash scripts/setup_isaacsim.sh
 # shellcheck disable=SC1091
 source scripts/source_isaacsim_setup.sh
@@ -112,17 +109,21 @@ assert exp.simulator.config.sim.max_episode_length_s == 10.0
 print("getup experiment config resolves OK:", sorted(exp.reward.terms))
 EOF
 
-echo "== [5/6] Train: $EXP  sim=isaacsim envs=$NUM_ENVS iters=$ITERATIONS seed=$SEED =="
+echo "== [5/6] Train: $EXP  sim=isaacsim envs=$NUM_ENVS iters=${ITERATIONS:-exp-default} seed=$SEED =="
 LOGGER_ARGS=()
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
   LOGGER_ARGS=(logger:wandb)
   echo "wandb enabled"
 fi
+ITER_ARGS=()
+if [[ -n "$ITERATIONS" ]]; then
+  ITER_ARGS=(--algo.config.num_learning_iterations "$ITERATIONS")
+fi
 python src/holosoma/holosoma/train_agent.py "exp:$EXP" "${LOGGER_ARGS[@]}" \
   --import-file "$REPO_DIR/src/everest_locomotion/holosoma_ext/a3_ultra_getup.py" \
   --training.num_envs "$NUM_ENVS" \
   --training.seed "$SEED" \
-  --algo.config.num_learning_iterations "$ITERATIONS" \
+  "${ITER_ARGS[@]}" \
   --algo.config.save_interval 2000
 
 echo "== [6/6] Collect artifacts =="

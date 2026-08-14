@@ -29,17 +29,18 @@ case "$TASK" in
   fastsac) EXP="a3-ultra-fast-sac" ;;
   ppo)     EXP="a3-ultra-ppo" ;;
   everest) EXP="a3-ultra-fast-sac-everest" ;;
-  getup)
-    EXP="a3-ultra-getup"
-    IMPORT_FILE="$REPO_DIR/src/everest_locomotion/holosoma_ext/getup_presets.py"
+  getup|getup-fast-sac)
+    # The get-up extension imports a3_ultra_presets itself, so it is the only
+    # --import-file needed. Real runs: scripts/cloud/train_a3_getup_cloud.sh.
+    [[ "$TASK" == "getup" ]] && EXP="a3-ultra-getup" || EXP="a3-ultra-getup-fast-sac"
+    IMPORT_FILE="$REPO_DIR/src/everest_locomotion/holosoma_ext/a3_ultra_getup.py"
     ;;
-  *) echo "unknown task: $TASK (use fastsac|ppo|everest|getup)"; exit 1 ;;
+  *) echo "unknown task: $TASK (use fastsac|ppo|everest|getup|getup-fast-sac)"; exit 1 ;;
 esac
 
-# The presets resolve the asset directory from here; the get-up task also needs
-# `everest_locomotion` importable for its env_class / reward terms.
+# The presets resolve the asset directory and the fallen-pose bank from here.
 export EVEREST_A3_ASSET_ROOT="$REPO_DIR/assets/a3_ultra/holosoma"
-export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+export EVEREST_A3_GETUP_POSES="$REPO_DIR/assets/a3_ultra/getup"
 
 cd "$HOLOSOMA_DIR"
 

@@ -1,8 +1,14 @@
 # Third-party dependencies
 
 External repositories are cloned here but git-ignored; this file records exactly what
-to clone and at which commit. `scripts/setup/clone_third_party.ps1` (Windows) and
-`scripts/setup/clone_third_party.sh` (WSL2/Linux) automate it.
+to clone and at which commit. `make check-model` and `make convert-assets` need
+`A3-A3U-robot-model` present:
+
+```bash
+git clone https://github.com/AgibotTech/A3-A3U-robot-model third_party/A3-A3U-robot-model
+git -C third_party/A3-A3U-robot-model checkout 589f508ff357447c610a3f3004419035ddc8f153
+git clone --branch v2.3.0 https://github.com/isaac-sim/IsaacLab third_party/IsaacLab
+```
 
 | Project | URL | Pinned commit | License | Purpose |
 | --- | --- | --- | --- | --- |
