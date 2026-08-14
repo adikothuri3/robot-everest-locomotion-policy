@@ -10,11 +10,13 @@ Metrics per rollout: survival, fall time, slip distance/events, tilt, tracking
 error, torque saturation, action jitter, joint-limit events (see
 everest_locomotion.evaluation.rollout).
 
-Results: results/stability/<run_name>.json (+ per-scenario rows). Policies:
-  --policy stand           PD hold of default pose (pipeline baseline; a
-                           non-stepping PD cannot absorb large pushes — its
-                           numbers are the floor, not a target)
-  --policy onnx --onnx P   exported Holosoma policy (obs layout must match)
+Results: results/stability/<run_name>.json (+ per-scenario rows).
+
+This script exists to record and re-record the **PD-stand floor** only. Trained
+Holosoma policies need the real observation contract (100-dim, alphabetical term
+order, 2-dim gait clock) which this harness's obs dict does not provide — use
+`scripts/eval/sim2sim_suite.py` for those, and its `--mode grid --with-baseline`
+to compare a policy against the PD-stand control on one harness.
 
 Usage:
     python scripts/eval/stability_suite.py --policy stand --quick
@@ -36,7 +38,7 @@ from everest_locomotion.robots.manifest import load_manifest
 from everest_locomotion.sim_adapters.mujoco_adapter import MujocoRobot
 from everest_locomotion.sim_adapters.mujoco_scene import model_with_terrain
 from everest_locomotion.terrains import TerrainSpec, procedural_rough
-from everest_locomotion.policies import PDStandPolicy, OnnxPolicy
+from everest_locomotion.policies import PDStandPolicy
 from everest_locomotion.evaluation.rollout import Push, run_rollout
 
 # Diagnostic-stiff hold gains for the stand baseline (see check_mujoco_model.py)
@@ -56,20 +58,12 @@ def make_policy(args, manifest):
     default_ctrl = manifest.default_pose_vector()[ctrl_idx]
     if args.policy == "stand":
         return PDStandPolicy(default_ctrl)
-    if args.policy == "onnx":
-        layout = args.obs_layout.split(",")
-        return OnnxPolicy(args.onnx, layout, default_ctrl, manifest.action_scale)
     raise ValueError(args.policy)
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--policy", choices=["stand", "onnx"], default="stand")
-    p.add_argument("--onnx")
-    p.add_argument(
-        "--obs-layout",
-        default="base_ang_vel,projected_gravity,command,joint_pos,joint_vel,prev_action",
-    )
+    p.add_argument("--policy", choices=["stand"], default="stand")
     p.add_argument("--name", default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--quick", action="store_true", help="reduced grid for smoke testing")
@@ -139,7 +133,6 @@ def main() -> None:
     summary = {
         "run_name": run_name,
         "policy": args.policy,
-        "onnx": args.onnx,
         "seed": args.seed,
         "n_scenarios": len(rows),
         "n_survived": survived,

@@ -1,12 +1,20 @@
 ---
 title: Decisions
-updated: 2026-08-13
+updated: 2026-08-14
 status: current
 ---
 
 # Decisions
 
 Newest first. Each entry: what was chosen, why, what was rejected. Add an entry whenever a session makes a call that a future agent might otherwise re-litigate.
+
+## 2026-08-14 — Trained policies are evaluated by a new sim2sim harness, not the stability suite
+
+**Chosen:** `src/everest_locomotion/evaluation/sim2sim.py` + `scripts/eval/sim2sim_suite.py` own all trained-policy evaluation (four modes: `sweep`, `showcase`, `grid`, `pushlimit`), and it loads the **generated training MJCF**, not the official one, so the gate tests the same robot the URDF gave IsaacSim. **Why:** the observation contract could not be expressed in `stability_suite.py`'s obs dict — the real actor vector is 100-dim, concatenated in **alphabetical term order** (`ObservationManager.compute_group` sorts before `torch.cat`) and includes a **2-dim per-leg gait clock** with eval-mode phase offsets `[0, -π]` and a stand override at `π`. `docs/onnx_policy_interface.md` documented neither, and both errors produce a policy that falls instantly — indistinguishable from a bad checkpoint. Contract re-derived from holosoma `6e146b0` source and verified numerically (gyro vs `qvel[3:6]` for the body-frame angular velocity, `mj_objectVelocity` for the rotation convention). `policies.OnnxPolicy` now **raises** instead of running, and `stability_suite.py` lost its `--policy onnx` path, so the only remaining trap is closed; the suite keeps its one real job, recording the PD-stand floor. **Rejected:** patching `OnnxPolicy` in place (its caller cannot supply a gait clock or per-step phase at all).
+
+## 2026-08-14 — Sim2sim spawn height is searched, not assumed
+
+Spawning at the terrain height under the *pelvis* buries the toe of a 0.27 m foot by ~2 cm on a 10° grade; MuJoCo resolves that penetration explosively and the episode dies at t≈0.3 s. That artifact alone made every slope ≥10° and all three alpine scenarios look like locomotion failures. Clearing the footprint *maximum* instead overcorrects (a 13 cm drop onto a slope is its own destabiliser), so `A3Sim._clear_spawn_height` scans upward for the lowest penetration-free height via `mj_forward`. After the fix, 10° and 15° slopes both survive and the remaining falls are late-episode (2.3–8.3 s) and genuine. **Rule:** on generated terrain, never trust a nominal spawn height — measure it.
 
 ## 2026-08-13 — Pre-cloud bug review of the get-up pipeline (two-agent audit)
 

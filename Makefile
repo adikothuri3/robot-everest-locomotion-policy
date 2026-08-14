@@ -5,7 +5,8 @@ PY := .venv/Scripts/python.exe
 WSL := wsl -d Ubuntu-24.04 -- env
 
 .PHONY: check-isaac check-model convert-assets test train-a3 train-a3-smoke train-a3-ppo \
-        train-getup-smoke fallen-poses eval-stand eval-suite
+        train-getup-smoke fallen-poses eval-stand sim2sim sim2sim-video sim2sim-grid \
+        sim2sim-sweep
 
 check-isaac:        ## Isaac Lab / PhysX A3 validation — primary sim leg (needs .venv-isaac)
 	.venv-isaac/Scripts/python.exe scripts/diagnostics/check_isaac_a3.py
@@ -39,8 +40,19 @@ train-getup-smoke:  ## short local get-up wiring check (MJWarp; real runs = trai
 fallen-poses:       ## regenerate the get-up fallen-pose bank (assets/a3_ultra/getup)
 	$(PY) scripts/getup/generate_fallen_poses.py
 
-eval-stand:         ## stability suite on the PD-stand baseline (pipeline check)
+eval-stand:         ## stability suite on the PD-stand baseline (the recorded floor)
 	$(PY) scripts/eval/stability_suite.py --policy stand
 
-eval-suite:         ## stability suite on an ONNX policy: make eval-suite ONNX=path/to.onnx
-	$(PY) scripts/eval/stability_suite.py --policy onnx --onnx $(ONNX)
+# Trained policies are evaluated by the sim2sim harness, which reproduces holosoma's
+# real observation/action contract (stability_suite.py cannot — see its docstring).
+sim2sim:            ## showcase scenarios, metrics only: make sim2sim ONNX=path/to.onnx
+	$(PY) scripts/eval/sim2sim_suite.py --mode showcase --onnx $(ONNX) --name showcase
+
+sim2sim-video:      ## showcase scenarios + mp4s and montage: make sim2sim-video ONNX=...
+	$(PY) scripts/eval/sim2sim_suite.py --mode showcase --onnx $(ONNX) --name showcase --video
+
+sim2sim-grid:       ## 68-scenario stability grid, policy vs PD-stand control on one harness
+	$(PY) scripts/eval/sim2sim_suite.py --mode grid --onnx $(ONNX) --name showcase --with-baseline
+
+sim2sim-sweep:      ## rank every checkpoint in a run: make sim2sim-sweep RUN=checkpoints/cloud_...
+	$(PY) scripts/eval/sim2sim_suite.py --mode sweep --run-dir $(RUN)

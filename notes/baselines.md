@@ -1,6 +1,6 @@
 ---
 title: Baselines & Scope
-updated: 2026-08-13
+updated: 2026-08-14
 status: current
 ---
 
@@ -38,3 +38,26 @@ What this project is built on, what it is deliberately **not**, and the measured
 | MuJoCo model diagnostics | 12/12 PASS (settle, contacts, penetration <0.1 mm, 0.15 m/s push) | `scripts/diagnostics/check_mujoco_model.py` |
 | Cross-sim consistency (MuJoCo vs Isaac) | PASS when recorded; **needs re-running** — the URDF was rebuilt after that run (`make check-isaac`) | `docs/simulator_consistency.md` |
 | E00/E01 training smoke | GPU WarpBackend, 0 nefc overflows, ~30 s/it locally | [[experiments]] |
+
+## Cleared, 2026-08-14 — locomotion (E02/E06 → E08)
+
+The first cloud run beat every locomotion floor on the MuJoCo gate. New numbers to hold,
+not just beat:
+
+| Measure | Floor | `model_0050000.onnx` |
+| --- | --- | --- |
+| Stability grid (68 scenarios) | 25/68 recorded, 26/68 re-measured head-to-head | **68/68** |
+| Max recoverable push, standing | 0.2–0.3 m/s | **2.0–3.0 m/s** |
+| Max recoverable push, walking | n/a (PD stand cannot walk) | **2.5–4.0 m/s** |
+| Extended showcase (41 scenarios) | — | **37/41** |
+
+> [!warning] Angular tracking is the weak axis
+> `rew_tracking_ang_vel` finished at 0.559 against the 0.8 threshold the run's own config
+> declares, and the gate measures 3–6°/s of uncommanded yaw drift. Linear tracking clears
+> its gate comfortably (1.272 vs 0.95). The recipe has no heading observation, so heading
+> error integrates by construction — fix on the next run, not by re-tuning this one.
+
+The four failures are `friction_mu0.1` and the three *combined* alpine scenarios
+(rough + slope + low friction + gusts). Each ingredient alone is survivable, which makes
+the alpine fine-tune (M4) a measured gap rather than an assumed one.
+Full detail: `docs/sim2sim_locomotion_report.md`; videos in `results/videos/showcase/`.

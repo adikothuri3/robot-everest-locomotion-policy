@@ -34,32 +34,22 @@ class PDStandPolicy:
 
 
 class OnnxPolicy:
-    """Runs an exported ONNX locomotion policy.
+    """Retired 2026-08-14 — this was never a valid Holosoma consumer.
 
-    obs_layout: ordered list of obs-dict keys concatenated into the network
-    input; must match the training-time observation config (record it in the
-    checkpoint metadata when exporting from Holosoma).
+    It assumed a caller-supplied observation order and a phase-free observation.
+    The real exported policy takes a 100-dim vector concatenated in
+    **alphabetical term order** including a 2-dim per-leg gait clock, and the
+    rollout harness this class plugged into supplies neither. Feeding it a real
+    checkpoint produces a policy that falls over instantly, which is far too
+    easy to misread as a bad checkpoint.
+
+    Use `everest_locomotion.evaluation.sim2sim.HolosomaPolicy` instead; it reads
+    the contract out of the ONNX metadata. Contract: `docs/onnx_policy_interface.md`.
     """
 
-    def __init__(
-        self,
-        onnx_path: str,
-        obs_layout: list[str],
-        default_pose_ctrl: np.ndarray,
-        action_scale: float,
-    ):
-        import onnxruntime as ort  # lazy: only needed when evaluating ONNX
-
-        self.session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-        self.input_name = self.session.get_inputs()[0].name
-        self.obs_layout = obs_layout
-        self.default = default_pose_ctrl.copy()
-        self.action_scale = action_scale
-
-    def reset(self) -> None:
-        pass
-
-    def act(self, obs: dict[str, np.ndarray]) -> np.ndarray:
-        x = np.concatenate([np.asarray(obs[k], dtype=np.float32).ravel() for k in self.obs_layout])
-        action = self.session.run(None, {self.input_name: x[None]})[0][0]
-        return self.default + self.action_scale * action
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(
+            "OnnxPolicy is retired — its observation layout does not match Holosoma "
+            "exports. Use everest_locomotion.evaluation.sim2sim.HolosomaPolicy "
+            "(scripts/eval/sim2sim_suite.py)."
+        )

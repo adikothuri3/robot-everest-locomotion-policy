@@ -62,11 +62,19 @@ wsl -d Ubuntu-24.04 -- env SIMULATOR=mjwarp bash scripts/train/train_a3_wsl.sh f
 **Get-up** trains from the same stack: `bash scripts/cloud/train_a3_getup_cloud.sh`
 on the cloud box (`make train-getup-smoke` is the local wiring check only).
 
-### 5. Evaluate stability
+### 5. Evaluate a trained policy (MuJoCo sim2sim gate)
 ```powershell
-.venv\Scripts\python scripts/eval/stability_suite.py --policy stand --quick   # pipeline check
-.venv\Scripts\python scripts/eval/stability_suite.py --policy onnx --onnx checkpoints/<policy>.onnx
+$P = "checkpoints/<run>/model_0050000.onnx"
+.venv\Scripts\python scripts/eval/sim2sim_suite.py --mode sweep --run-dir checkpoints/<run>
+.venv\Scripts\python scripts/eval/sim2sim_suite.py --mode showcase --onnx $P --name showcase --video
+.venv\Scripts\python scripts/eval/sim2sim_suite.py --mode grid --onnx $P --name showcase --with-baseline
+.venv\Scripts\python scripts/eval/stability_suite.py --policy stand --quick   # PD-stand floor only
 ```
+Videos land in `results/videos/<name>/`, metrics in `results/sim2sim/`. The first
+run's results: `docs/sim2sim_locomotion_report.md` (68/68 vs a 26/68 PD-stand
+control). `stability_suite.py` records the floor and nothing else — trained
+policies need the real observation contract, which only the sim2sim harness
+implements (`docs/onnx_policy_interface.md`).
 
 ## Architecture
 
@@ -79,8 +87,10 @@ src/everest_locomotion/
   sim_adapters/mujoco_scene.py   inject generated terrain heightfields into scenes
   terrains/                      TerrainSpec/TerrainPatch interface + procedural_rough
                                  (Tomasz's Everest generator plugs in here later)
-  policies/                      Policy protocol; PDStand baseline; ONNX runner
+  policies/                      Policy protocol; PDStand floor baseline
   evaluation/rollout.py          metric-instrumented rollouts (slip, tilt, saturation...)
+  evaluation/sim2sim.py          exported-policy runner: holosoma's exact obs/action
+                                 contract in MuJoCo classic (the trained-policy gate)
   holosoma_ext/a3_ultra_presets.py  Holosoma --import-file: A3 robot + locomotion experiments
   holosoma_ext/a3_ultra_getup.py    Holosoma --import-file: get-up task (env, rewards,
                                  pose-bank resets, assist-force curriculum)
@@ -118,10 +128,15 @@ Get-up: E11 HoST feasibility probe → E12 get-up task in Holosoma
 handoff → E15 slope/rough get-up. Definitions and status: `experiments/README.md`.
 
 ## Sim-to-sim validation
-Train in IsaacSim/PhysX → evaluate in MuJoCo classic (`stability_suite.py`), the
-independent-physics gate → Isaac Lab for PhysX-side articulation checks
+Train in IsaacSim/PhysX → evaluate in MuJoCo classic (`scripts/eval/sim2sim_suite.py`),
+the independent-physics gate → Isaac Lab for PhysX-side articulation checks
 (`make check-isaac`). Model-property consistency: `scripts/diagnostics/dump_model_properties.py`
 + `compare_sim_properties.py` (see `docs/simulator_consistency.md`).
+
+**Status (2026-08-14):** the first cloud-trained locomotion policy passes the gate —
+68/68 stability scenarios against a 26/68 PD-stand control on the same harness, and
+2.5–4.0 m/s recoverable pushes against a 0.2–0.3 m/s floor. Full report and videos:
+`docs/sim2sim_locomotion_report.md`.
 
 ## Known limitations
 - 8 GB VRAM: keep `num_envs` ≈ 512–2048; no camera-based training on this machine.
