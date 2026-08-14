@@ -107,7 +107,8 @@ python scripts/eval/stability_suite.py --policy stand --quick
 | `nohup` background jobs die when WSL session detaches | keep session attached (documented in tooling.md) |
 | A3 mesh collisions → `nefc overflow (njmax)` in MJWarp | fixed: primitive-collision training asset (10 AABB boxes + official foot spheres); zero overflows after |
 | Isaac URDF importer inflated robot to 79.5 kg (zero-mass shell/sensor links auto-massed from mesh volume) | **caught by the Phase-7 comparator**; fixed: tiny inertials stamped in URDF conversion |
-| **FastSAC wall-clock ~25 s/iteration on this machine (G1 E00, 512 envs)** — vs ~55 it/s on a 4090 upstream | **open**; run confirmed fully on GPU (CUDA graphs captured, VRAM resident). Per user direction, deep diagnosis deferred. Prime suspects for follow-up: WSL2 GPU submission latency for the non-graphed portions (managers/obs on torch), and mesh-collision broadphase cost (A3 asset uses per-link mesh collisions; G1's uses primitives). See §14. |
+| **MJWarp training path produces physics NaNs** under untrained-policy flailing — on BOTH upstream G1 and A3 (control experiment ruled out the A3 port). Bisection: PyPI mujoco-warp 3.11.0 = NaN at step ~9; holosoma-pinned `ecaef88` + warp 1.15.0 = step ~85; env is fully healthy under zero actions (obs/terrain/rewards verified clean) | **root-caused**: holosoma's nightly training matrix validates FastSAC on `[isaacgym, isaacsim]` ONLY — MJWarp is smoke-tested, not training-validated. Decision: cloud training uses the **IsaacSim backend** (A3 works unchanged — backend auto-converts our validated URDF); MJWarp kept for smoke runs with the best-known pin combo |
+| FastSAC wall-clock 11-30 s/iteration on this machine (vs ~55 it/s upstream on 4090) | **decision (user): train in the cloud** — `scripts/cloud/train_a3_cloud.sh` + `docs/cloud_training.md`; local machine does validation (stability suite, sim2sim) |
 | Isaac Lab on 8 GB VRAM (min spec 16 GB) | headless boot OK; keep envs ≤ ~2k, no cameras |
 
 ## 12. Remaining blockers
@@ -126,16 +127,18 @@ E01/E02 as smoke + flat-walk on `a3-ultra-fast-sac` (512-1024 envs), then E06
 cross-physics (ONNX → MuJoCo classic → Isaac). Ladder: `experiments/README.md`.
 
 ## 14. Next 5 highest-value actions
-1. **Fix training throughput**: generate a primitive-collision variant of the A3
-   training asset (AABB-fitted boxes/capsules; feet keep official spheres) and
-   benchmark it; if still slow, benchmark the same run on native Linux to isolate
-   WSL overhead; consider Holosoma IsaacSim backend on Windows-native Isaac.
-2. Run E02 to convergence and score it with `stability_suite.py` (baseline numbers
-   for every later comparison).
+1. **Run the cloud training** (`scripts/cloud/train_a3_cloud.sh` on a 24 GB Linux
+   GPU): `a3-ultra-fast-sac` and `a3-ultra-fast-sac-everest`, seeds {1,2,3};
+   pick by stability-suite survival + max recoverable push (floor to beat:
+   `results/stability/pd_stand_baseline.json`).
+2. Cross-physics validation of the winning checkpoint: Holosoma `run_policy.py`
+   MuJoCo sim2sim + our ONNX stability suite (fix per-joint action scaling per
+   `docs/onnx_policy_interface.md` first).
 3. Obtain real actuator specs (PD gains, armature, gear inertia) from AgiBot docs
    or the A3 SDK; replace assumptions in the manifest (single edit point).
-4. Wire the Isaac Lab arm end-to-end: A3 `ArticulationCfg` + copy of the G1 rough
-   velocity task (configs exist upstream; `check_isaac_a3.py` already produces the
-   converted USD via the URDF importer) → E07 + PhysX leg of E08.
+4. Build the get-up/fall-recovery task the manifest now specifies (`getup:`
+   section; asset already has full-body collision boxes + lying keyframes) —
+   directly serves the disturbance-recovery objective.
 5. Integrate Tomasz's terrain through `TerrainPatch` → Holosoma custom terrain term
-   (mesh export path exists upstream) → first alpine curriculum (E10).
+   (mesh export path exists upstream) → first alpine curriculum (E10); wire the
+   Isaac Lab arm (E07/E08 PhysX leg) as compute allows.

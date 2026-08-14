@@ -1,37 +1,45 @@
 #!/bin/bash
 # =============================================================================
-# Turnkey cloud training: AgiBot A3 Ultra stable walking (Holosoma FastSAC/MJWarp)
+# Turnkey cloud training: AgiBot A3 Ultra stable walking (Holosoma FastSAC)
 # =============================================================================
 # Run this ON a fresh Linux GPU instance (Ubuntu 22.04 or 24.04, NVIDIA driver
-# >= 555.58.02, 24 GB VRAM recommended: RTX 4090 / L40S / A10G-24 / A100).
+# >= 555.58.02, 24 GB VRAM recommended: RTX 4090 / L40S / A10G / L4 / A100).
 #
 #   git clone <this-repo-url> everest && cd everest
 #   bash scripts/cloud/train_a3_cloud.sh                    # full stable-walk run
 #
 # Environment overrides:
-#   EXP=a3-ultra-fast-sac|a3-ultra-fast-sac-everest|a3-ultra-ppo  (default: a3-ultra-fast-sac)
-#   NUM_ENVS=4096      ITERATIONS=50000     SEED=1
-#   WANDB_API_KEY=...  (optional; enables logger:wandb + auto ONNX upload)
+#   SIMULATOR=isaacsim|mjwarp   (default isaacsim — see WHY below)
+#   EXP=a3-ultra-fast-sac|a3-ultra-fast-sac-everest|a3-ultra-ppo
+#   NUM_ENVS=4096   ITERATIONS=50000   SEED=1
+#   WANDB_API_KEY=...           (optional; enables logger:wandb + ONNX upload)
 #
-# Everything this script pins/patches exists because it broke in bring-up:
+# WHY isaacsim: holosoma's own nightly training matrix validates FastSAC on
+# [isaacgym, isaacsim] ONLY. The MJWarp backend is smoke-tested but NOT
+# training-validated upstream, and we reproduced deterministic physics NaNs
+# under early-training flailing on MJWarp (upstream G1 asset, pinned versions,
+# 2026-08-13) — the A3 port was not the cause (control experiment). Use MJWarp
+# only for short local smoke runs.
+#
+# Pins/patches (each one broke during bring-up — do not unpin casually):
 #   * holosoma @ 6e146b0 (2026-08-11) — validated commit
-#   * mujoco_warp @ ecaef88 — holosoma's own pin; the PyPI 3.11.0 release
-#     produces DIVERGING PHYSICS (NaN/1e12 velocities) with this holosoma
-#     commit on BOTH G1 and A3 (verified 2026-08-13)
-#   * warp_utils patch — Warp >= 1.16 removed wp.types.array
-#   * A3 asset — generated variant (primitive collisions: official mesh
-#     collisions overflow MJWarp constraint budget; armature; solref 0.01)
+#   * (mjwarp path only) mujoco_warp @ ecaef88 = holosoma's own pin; PyPI
+#     mujoco-warp 3.11.0 diverges violently. Best local combo found:
+#     mujoco 3.11.0 + mujoco_warp ecaef88 + warp-lang 1.15.0 — still NaNs
+#     under sustained random flailing, hence isaacsim default.
+#   * (mjwarp path only) warp_utils patch — Warp >= 1.16 removed wp.types.array
+#   * A3 asset — generated (primitive collisions, armature, solref 0.01)
 #
-# Why this recipe for "immense stability": exp:a3-ultra-fast-sac is the
-# upstream FastSAC sim-to-real recipe unchanged except for the robot — it
-# already trains WITH rough-terrain mix, periodic push perturbations, friction/
-# mass/CoM/PD-gain/torque-RFI/latency randomization, and an action-rate
-# curriculum, and is hardware-validated on two humanoids. Train this first;
-# then compare exp:a3-ultra-fast-sac-everest (adds stumble/foothold/joint-limit
-# penalties + stronger alive weight) on the stability suite and keep the winner.
+# Recipe for "immense stability": exp:a3-ultra-fast-sac is the upstream FastSAC
+# sim-to-real recipe unchanged except for the robot — rough-terrain mix, pushes
+# every 5-10 s, friction/mass/CoM/PD/torque-RFI/latency randomization, action-
+# rate curriculum; hardware-validated on two humanoids. Train it first, then
+# exp:a3-ultra-fast-sac-everest (stumble/foothold/joint-limit penalties,
+# alive 15) and keep the stability-suite winner.
 # =============================================================================
 set -euo pipefail
 
+SIMULATOR="${SIMULATOR:-isaacsim}"
 EXP="${EXP:-a3-ultra-fast-sac}"
 NUM_ENVS="${NUM_ENVS:-4096}"
 ITERATIONS="${ITERATIONS:-50000}"
@@ -46,8 +54,8 @@ echo "== [1/6] Sanity =="
 command -v nvidia-smi >/dev/null || { echo "ERROR: no NVIDIA driver"; exit 1; }
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 test -f "$REPO_DIR/assets/a3_ultra/holosoma/a3_ultra_29dof.xml" || {
-  echo "ERROR: generated A3 asset missing. Run on a machine with the asset committed,"
-  echo "or regenerate: python scripts/convert/make_holosoma_asset.py (needs third_party model)"
+  echo "ERROR: generated A3 asset missing (assets/a3_ultra/holosoma). It is committed"
+  echo "to the repo; if absent regenerate with scripts/convert/make_holosoma_asset.py"
   exit 1
 }
 
@@ -57,32 +65,53 @@ if [[ ! -d "$WORK/holosoma" ]]; then
 fi
 git -C "$WORK/holosoma" fetch --all --quiet || true
 git -C "$WORK/holosoma" checkout -q "$HOLOSOMA_COMMIT"
-
-echo "== [3/6] Environment (uv, Python auto: 22.04->3.10 / 24.04->3.12) =="
 cd "$WORK/holosoma"
-bash scripts/setup_mujoco_via_uv.sh --no-robot-sdks
-export PATH="$HOME/.local/bin:$PATH"
-# shellcheck disable=SC1091
-source .venv/hsmujoco/bin/activate
 
-echo "== [4/6] Pin mujoco_warp + patch warp_utils =="
-uv pip install "git+https://github.com/google-deepmind/mujoco_warp.git@${MUJOCO_WARP_COMMIT}"
-python "$REPO_DIR/scripts/setup/patch_holosoma_warp.py" \
-  "$WORK/holosoma/src/holosoma/holosoma/utils/warp_utils.py"
-python - <<'EOF'
-import mujoco, warp, mujoco_warp, torch
+if [[ "$SIMULATOR" == "isaacsim" ]]; then
+  echo "== [3/6] IsaacSim environment (conda env hssim; Ubuntu 22.04+) =="
+  if ! command -v conda >/dev/null; then
+    echo "installing Miniforge..."
+    curl -fsSL -o /tmp/miniforge.sh \
+      "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
+    bash /tmp/miniforge.sh -b -p "$HOME/miniforge3"
+    # shellcheck disable=SC1091
+    source "$HOME/miniforge3/etc/profile.d/conda.sh"
+    conda init bash >/dev/null
+  else
+    CONDA_BASE=$(conda info --base)
+    # shellcheck disable=SC1091
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+  fi
+  bash scripts/setup_isaacsim.sh
+  # shellcheck disable=SC1091
+  source scripts/source_isaacsim_setup.sh
+  echo "== [4/6] Verify stack =="
+  python - <<'EOF'
+import torch
 assert torch.cuda.is_available(), "CUDA not available in torch"
-print("stack OK:", "mujoco", mujoco.__version__, "| warp", warp.__version__, "| cuda", torch.version.cuda)
+print("torch", torch.__version__, "| cuda", torch.version.cuda)
 EOF
+else
+  echo "== [3/6] MJWarp environment (uv; local-smoke quality only) =="
+  bash scripts/setup_mujoco_via_uv.sh --no-robot-sdks
+  export PATH="$HOME/.local/bin:$PATH"
+  # shellcheck disable=SC1091
+  source .venv/hsmujoco/bin/activate
+  echo "== [4/6] Pin known-best mjwarp combo + patch warp_utils =="
+  uv pip install "git+https://github.com/google-deepmind/mujoco_warp.git@${MUJOCO_WARP_COMMIT}"
+  uv pip install "warp-lang==1.15.0" "mujoco==3.11.0"
+  python "$REPO_DIR/scripts/setup/patch_holosoma_warp.py" \
+    "$WORK/holosoma/src/holosoma/holosoma/utils/warp_utils.py"
+fi
 
-echo "== [5/6] Train: $EXP  envs=$NUM_ENVS iters=$ITERATIONS seed=$SEED =="
+echo "== [5/6] Train: $EXP  sim=$SIMULATOR envs=$NUM_ENVS iters=$ITERATIONS seed=$SEED =="
 export EVEREST_A3_ASSET_ROOT="$REPO_DIR/assets/a3_ultra/holosoma"
 LOGGER_ARGS=()
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
   LOGGER_ARGS=(logger:wandb)
   echo "wandb enabled"
 fi
-python src/holosoma/holosoma/train_agent.py "exp:$EXP" simulator:mjwarp "${LOGGER_ARGS[@]}" \
+python src/holosoma/holosoma/train_agent.py "exp:$EXP" "simulator:$SIMULATOR" "${LOGGER_ARGS[@]}" \
   --import-file "$REPO_DIR/src/everest_locomotion/holosoma_ext/a3_ultra_presets.py" \
   --training.num_envs "$NUM_ENVS" \
   --training.seed "$SEED" \
@@ -94,9 +123,9 @@ RUN_DIR=$(ls -dt "$WORK"/holosoma/logs/everest-a3/*/ | head -1)
 OUT="$REPO_DIR/checkpoints/cloud_$(basename "$RUN_DIR")"
 mkdir -p "$OUT"
 cp "$RUN_DIR"/model_*.pt "$RUN_DIR"/model_*.onnx "$RUN_DIR"/holosoma_config.yaml "$OUT"/ 2>/dev/null || true
-cp -r "$RUN_DIR"/events.out.tfevents.* "$OUT"/ 2>/dev/null || true
+cp "$RUN_DIR"/events.out.tfevents.* "$OUT"/ 2>/dev/null || true
 echo "artifacts in: $OUT"
 echo "retrieve with: scp -r <instance>:$OUT ./checkpoints/"
 echo
-echo "Next (locally): validate cross-physics + stability:"
+echo "Next (locally): cross-physics + stability validation:"
 echo "  python scripts/eval/stability_suite.py --policy onnx --onnx checkpoints/<run>/model_*.onnx"

@@ -46,9 +46,13 @@ python src/holosoma/holosoma/train_agent.py exp:g1-29dof-fast-sac simulator:mjwa
 ```
 
 ### 4. Train the A3 Ultra
+**Cloud (recommended — local wall-clock is ~30 s/iter):** on a Linux GPU box,
+`bash scripts/cloud/train_a3_cloud.sh` — fully pinned and self-verifying; see
+`docs/cloud_training.md`.
 ```powershell
-# from Windows (or run the bash line inside WSL directly)
-wsl -d Ubuntu-24.04 -- bash scripts/train/train_a3_wsl.sh fastsac --training.num_envs 1024
+# local smoke runs (WSL2); NOTE: install the pinned mujoco_warp first
+# (scripts/setup/wsl_pin_mjwarp.sh) — PyPI mujoco-warp 3.11.0 breaks physics
+wsl -d Ubuntu-24.04 -- bash scripts/train/train_a3_wsl.sh fastsac --training.num_envs 512
 # variants: ppo | fastsac; Everest stability reward: exp:a3-ultra-fast-sac-everest
 ```
 

@@ -1,3 +1,7 @@
+# Obsidian per-machine UI state; the rest of notes/.obsidian IS tracked
+notes/.obsidian/workspace.json
+notes/.obsidian/workspace-mobile.json
+
 __pycache__/
 *.py[cod]
 *.egg-info/
