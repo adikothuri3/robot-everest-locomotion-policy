@@ -32,7 +32,9 @@ Note: the repo must include `assets/a3_ultra/holosoma/` (committed) — the
 official AgibotTech model repo is NOT needed on the cloud box.
 
 ## Which simulator backend (important)
-The script defaults to **`SIMULATOR=isaacsim`**. Holosoma's own nightly training
+**`isaacsim` is the repo-wide default** — the `a3_ultra_*` presets, the WSL
+training script, the `make train-a3*` targets, and this script all select it;
+MJWarp must be requested explicitly. Holosoma's own nightly training
 matrix validates FastSAC on `[isaacgym, isaacsim]` only; the MJWarp backend is
 smoke-tested but not training-validated upstream, and we reproduced
 deterministic physics NaNs under untrained-policy flailing on MJWarp with the

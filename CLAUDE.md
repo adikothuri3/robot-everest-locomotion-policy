@@ -2,7 +2,7 @@
 
 **Objective:** a smooth, stable, working **locomotion policy + get-up policy** for the **AgiBot A3 Ultra** (the only robot in scope), which then get **fine-tuned on Everest-like terrain** — ending with a stable and smooth alpine locomotion + get-up policy.
 
-Stack: Holosoma + FastSAC (MJWarp, WSL2) primary; Isaac Lab 2.3 + RSL-RL fallback; training in the cloud, validation local. Baselines, floors-to-beat, and scope boundaries: `notes/baselines.md`.
+Stack: Holosoma + FastSAC on **IsaacSim (PhysX) — the default simulator everywhere**; Isaac Lab 2.3 + RSL-RL as the PhysX validation leg and trainer fallback; MuJoCo/MJWarp for sim2sim evaluation and local smoke only. Training in the cloud, validation local. Baselines, floors-to-beat, and scope boundaries: `notes/baselines.md`.
 
 Everest terrain comes from the sibling repo `C:\Users\Aditya\VSCode\GeologicDome` (footage → LingBot-Map → sim terrain; its own vault is in `GeologicDome/notes/`). This repo consumes that terrain via `TerrainSpec`/`TerrainPatch`; it does not rebuild that pipeline. This repo's vault conventions mirror GeologicDome's.
 
@@ -35,5 +35,6 @@ Agent behavior:
 
 - **Robot truth** is `configs/robots/a3_ultra.yaml` — never index qpos directly; go through `MujocoRobot`. Official vs ASSUMED values are marked; don't blur them.
 - **`assets/a3_ultra/holosoma/*` is generated** by `scripts/convert/make_holosoma_asset.py` — never hand-edit; regenerate.
-- **mujoco_warp is pinned** to git `ecaef88` (PyPI 3.11.0 breaks physics). Never "upgrade" it casually.
+- **Default simulator is `isaacsim`** — presets, `scripts/train/train_a3_wsl.sh`, and the cloud script all default to it. Reach for `simulator:mjwarp` only for explicit local smoke runs.
+- **mujoco_warp is pinned** to git `ecaef88` (PyPI 3.11.0 breaks physics). Never "upgrade" it casually — applies to the smoke path only.
 - Judge policies against the recorded floors (`notes/baselines.md`), not against feel.

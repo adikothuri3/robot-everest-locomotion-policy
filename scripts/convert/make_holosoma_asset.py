@@ -1,5 +1,10 @@
 """Generate the Holosoma-ready A3 Ultra asset (29-DOF locomotion variant).
 
+The two outputs must be the SAME robot: IsaacSim/PhysX (the default training
+backend) imports the URDF, MuJoCo/MJWarp reads the MJCF, and the stability suite
+compares results across them. So both files are generated together and verified
+against one another and against `a3_ultra_presets.BODY_NAMES`.
+
 From the official a3_ultra_t2d5 model:
   MJCF: - weld head joints (head_yaw/head_pitch removed; bodies+mass kept)
         - remove their actuators/sensors
@@ -8,8 +13,14 @@ From the official a3_ultra_t2d5 model:
           (supine/prone/sides) for the get-up task
         - rename free joint to `floating_base_joint` (G1/Holosoma convention)
         - add massless-ish `*_foot_contact_point` bodies at the sole center
-        - rewrite mesh paths to local `meshes/`
-  URDF: - head joints revolute -> fixed
+        - mesh collisions -> AABB boxes; rewrite mesh paths to local `meshes/`
+  URDF: - head joints revolute -> fixed, marked `dont_collapse` so the links
+          survive the importer's fixed-joint merge (the config names them)
+        - `*_foot_contact_point` links added, same `dont_collapse` treatment
+          (upstream G1 does exactly this)
+        - mesh collisions replaced by the MJCF's primitives, transplanted
+          body-by-body (link frames are identical between the two files)
+        - zero-mass decorative links get tiny valid inertials
   Copies referenced meshes next to the outputs.
 
 Output: assets/a3_ultra/holosoma/{a3_ultra_29dof.xml, a3_ultra_29dof.urdf, meshes/}
@@ -29,6 +40,17 @@ OUT_DIR = REPO / "assets" / "a3_ultra" / "holosoma"
 
 HEAD_JOINTS = {"head_yaw_joint", "head_pitch_joint"}
 FOOT_SOLE_POS = "0.04 0 -0.067"  # sole center in ankle_roll frame (= official foot site)
+
+# Links that must survive the URDF importer's fixed-joint merge because the
+# Holosoma robot config names them in `body_names` / `key_bodies`. IsaacLab's
+# and IsaacGym's importers honour the `dont_collapse` attribute on the fixed
+# joint (upstream G1's URDF uses the same trick for its foot contact points).
+URDF_KEEP_LINKS = {
+    "head_yaw_Link",
+    "head_pitch_Link",
+    "left_foot_contact_point",
+    "right_foot_contact_point",
+}
 
 # Bodies that keep a (primitive) collision geom in the training asset. The
 # official per-link MESH collisions overflow MJWarp's per-env constraint
@@ -347,7 +369,82 @@ def add_lying_keyframes() -> None:
     print(f"keyframes written: {list(keys)}")
 
 
+def _quat_to_rpy(quat) -> tuple[float, float, float]:
+    """MuJoCo wxyz quaternion -> URDF fixed-axis rpy (R = Rz(y) Ry(p) Rx(r))."""
+    import numpy as np
+
+    w, x, y, z = (float(v) for v in quat)
+    m00 = 1 - 2 * (y * y + z * z)
+    m10 = 2 * (x * y + w * z)
+    m20 = 2 * (x * z - w * y)
+    m21 = 2 * (y * z + w * x)
+    m22 = 1 - 2 * (x * x + y * y)
+    pitch = float(np.arcsin(np.clip(-m20, -1.0, 1.0)))
+    roll = float(np.arctan2(m21, m22))
+    yaw = float(np.arctan2(m10, m00))
+    return roll, pitch, yaw
+
+
+def _mjcf_collision_primitives() -> dict[str, list[dict]]:
+    """Collision primitives of the generated MJCF, keyed by body name.
+
+    Read back from the compiled MJCF so the URDF gets byte-identical geometry:
+    the AABB boxes on the contact bodies plus the official foot spheres. Both
+    files use the same link frames (verified: inertial origins agree), so geom
+    pose in the MuJoCo body frame is the URDF collision origin unchanged.
+    """
+    import mujoco
+
+    m = mujoco.MjModel.from_xml_path(str(OUT_DIR / "a3_ultra_29dof.xml"))
+    out: dict[str, list[dict]] = {}
+    for g in range(m.ngeom):
+        if m.geom_contype[g] == 0 and m.geom_conaffinity[g] == 0:
+            continue
+        body = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[g])
+        if body in (None, "world"):
+            continue
+        gtype = m.geom_type[g]
+        entry = {
+            "xyz": " ".join(f"{v:.6f}" for v in m.geom_pos[g]),
+            "rpy": " ".join(f"{v:.6f}" for v in _quat_to_rpy(m.geom_quat[g])),
+        }
+        if gtype == mujoco.mjtGeom.mjGEOM_BOX:
+            entry["shape"] = "box"
+            entry["args"] = {"size": " ".join(f"{2 * v:.6f}" for v in m.geom_size[g][:3])}
+        elif gtype == mujoco.mjtGeom.mjGEOM_SPHERE:
+            entry["shape"] = "sphere"
+            entry["args"] = {"radius": f"{m.geom_size[g][0]:.6f}"}
+        else:
+            raise ValueError(
+                f"unsupported collision geom type {mujoco.mjtGeom(gtype).name} on {body}; "
+                "extend the URDF mirror before regenerating"
+            )
+        out.setdefault(body, []).append(entry)
+    return out
+
+
+def _add_kept_link(root, link_name: str, parent: str, xyz: str) -> None:
+    """Append a massless-ish link on a `dont_collapse` fixed joint (G1 pattern)."""
+    link = ET.SubElement(root, "link", name=link_name)
+    ine = ET.SubElement(link, "inertial")
+    ET.SubElement(ine, "mass", value="0.001")
+    ET.SubElement(ine, "inertia", ixx="1e-7", ixy="0", ixz="0", iyy="1e-7", iyz="0", izz="1e-7")
+    # IsaacLab's USD conversion wants a visual prim on every link.
+    vis = ET.SubElement(link, "visual")
+    ET.SubElement(vis, "origin", xyz="0 0 0", rpy="0 0 0")
+    geo = ET.SubElement(vis, "geometry")
+    ET.SubElement(geo, "box", size="0.001 0.001 0.001")
+    mat = ET.SubElement(vis, "material", name="invisible")
+    ET.SubElement(mat, "color", rgba="0 0 0 0")
+    joint = ET.SubElement(root, "joint", name=f"{link_name}_joint", type="fixed")
+    joint.set("dont_collapse", "true")
+    ET.SubElement(joint, "parent", link=parent)
+    ET.SubElement(joint, "child", link=link_name)
+    ET.SubElement(joint, "origin", xyz=xyz, rpy="0 0 0")
+
+
 def convert_urdf() -> None:
+    primitives = _mjcf_collision_primitives()
     tree = ET.parse(SRC_DIR / "urdf" / "model.urdf")
     root = tree.getroot()
     root.set("name", "a3_ultra_29dof")
@@ -378,19 +475,117 @@ def convert_urdf() -> None:
                 inertia.set(k, "0")
             n_zero += 1
     print(f"URDF: stamped tiny inertials on {n_zero} zero-mass links")
+
     # mesh paths: point into local meshes/
     for mesh in root.iter("mesh"):
         f = mesh.get("filename")
         if f:
             mesh.set("filename", f"meshes/{Path(f).name}")
+
+    # Collisions: drop the official per-link meshes (PhysX would convex-hull 47
+    # of them per robot) and transplant the MJCF's primitives, so both physics
+    # engines see the same contact geometry.
+    n_drop = n_prim = 0
+    for link in root.iter("link"):
+        for col in list(link.findall("collision")):
+            link.remove(col)
+            n_drop += 1
+        for entry in primitives.get(link.get("name"), []):
+            col = ET.SubElement(link, "collision")
+            ET.SubElement(col, "origin", xyz=entry["xyz"], rpy=entry["rpy"])
+            geo = ET.SubElement(col, "geometry")
+            ET.SubElement(geo, entry["shape"], **entry["args"])
+            n_prim += 1
+    print(f"URDF: replaced {n_drop} mesh collisions with {n_prim} MJCF primitives")
+
+    # The IsaacSim importer demonstrably does NOT merge fixed joints even with
+    # merge_fixed_joints=True (cloud run 2026-08-14: all 47 links surfaced as
+    # articulation bodies), so relying on merge is unsafe. Make the URDF
+    # physically contain EXACTLY the MJCF's 34 bodies: delete the decorative
+    # leaf links (torso shell, cameras, IMUs, hand palms, knee shells) and fold
+    # their mass by rewriting every kept link's inertial from the compiled MJCF
+    # (whose bodies already lump welded children; total-mass parity asserted in
+    # verify()).
+    import mujoco
+
+    m = mujoco.MjModel.from_xml_path(str(OUT_DIR / "a3_ultra_29dof.xml"))
+    mjcf_bodies = {
+        mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, b) for b in range(1, m.nbody)
+    }
+    removed = []
+    for link in list(root.findall("link")):
+        name = link.get("name")
+        if name not in mjcf_bodies:
+            root.remove(link)
+            removed.append(name)
+    for joint in list(root.findall("joint")):
+        child = joint.find("child")
+        if child is not None and child.get("link") in removed:
+            root.remove(joint)
+    print(f"URDF: removed {len(removed)} decorative links (masses folded via MJCF inertials)")
+
+    n_sync = 0
+    for link in root.findall("link"):
+        bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, link.get("name"))
+        if bid < 0:
+            continue
+        ine = link.find("inertial")
+        if ine is None:
+            ine = ET.SubElement(link, "inertial")
+        for el in list(ine):
+            ine.remove(el)
+        rpy = _quat_to_rpy(m.body_iquat[bid])
+        ET.SubElement(
+            ine, "origin",
+            xyz=" ".join(f"{v:.8f}" for v in m.body_ipos[bid]),
+            rpy=" ".join(f"{v:.8f}" for v in rpy),
+        )
+        ET.SubElement(ine, "mass", value=f"{m.body_mass[bid]:.8f}")
+        dx, dy, dz = m.body_inertia[bid]
+        ET.SubElement(
+            ine, "inertia",
+            ixx=f"{dx:.9f}", ixy="0", ixz="0", iyy=f"{dy:.9f}", iyz="0", izz=f"{dz:.9f}",
+        )
+        n_sync += 1
+    print(f"URDF: synced {n_sync} link inertials from compiled MJCF")
+
+    # Links the Holosoma config names; keep them through any importer merge too.
+    for joint in root.iter("joint"):
+        if joint.get("name") in HEAD_JOINTS:
+            joint.set("dont_collapse", "true")
+    for side in ("left", "right"):
+        _add_kept_link(
+            root, f"{side}_foot_contact_point", f"{side}_ankle_roll_Link", FOOT_SOLE_POS
+        )
+
     ET.indent(tree)
     tree.write(OUT_DIR / "a3_ultra_29dof.urdf")
-    print(f"URDF written: {OUT_DIR / 'a3_ultra_29dof.urdf'} ({n} head joints fixed)")
+    n_links = len(root.findall("link"))
+    print(f"URDF written: {OUT_DIR / 'a3_ultra_29dof.urdf'} ({n} head joints fixed, "
+          f"{n_links} links total, {len(URDF_KEEP_LINKS)} marked dont_collapse)")
+
+
+def urdf_merged_links(urdf_path: Path) -> list[str]:
+    """Links that survive an importer's fixed-joint merge, in URDF declaration order.
+
+    Mirrors IsaacLab/IsaacGym semantics: a link is merged into its parent when
+    its parent joint is `fixed` and not marked `dont_collapse`. The articulation
+    root always survives.
+    """
+    root = ET.parse(urdf_path).getroot()
+    links = [link.get("name") for link in root.iter("link")]
+    merged = {
+        j.find("child").get("link")
+        for j in root.iter("joint")
+        if j.get("type") == "fixed" and j.get("dont_collapse") != "true"
+    }
+    return [name for name in links if name not in merged]
 
 
 def verify() -> None:
     import mujoco
 
+    urdf_path = OUT_DIR / "a3_ultra_29dof.urdf"
     m = mujoco.MjModel.from_xml_path(str(OUT_DIR / "a3_ultra_29dof.xml"))
     hinges = sum(1 for j in range(m.njnt) if m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE)
     assert hinges == 29, f"expected 29 hinge joints, got {hinges}"
@@ -412,8 +607,42 @@ def verify() -> None:
         if floor not in (d.contact[c].geom1, d.contact[c].geom2) and d.contact[c].dist < 0
     ]
     assert not self_contacts, f"spurious self-contacts at default pose: {self_contacts[:6]}"
+
+    # --- URDF <-> MJCF parity (IsaacSim trains on the URDF, MuJoCo gates on the MJCF) ---
+    mjcf_bodies = [
+        mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, b)
+        for b in range(m.nbody)
+        if mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, b) != "world"
+    ]
+    urdf_bodies = urdf_merged_links(urdf_path)
+    assert set(urdf_bodies) == set(mjcf_bodies), (
+        "URDF (post-merge) and MJCF body sets differ:\n"
+        f"  URDF only: {sorted(set(urdf_bodies) - set(mjcf_bodies))}\n"
+        f"  MJCF only: {sorted(set(mjcf_bodies) - set(urdf_bodies))}"
+    )
+
+    urdf_root = ET.parse(urdf_path).getroot()
+    urdf_mass = sum(
+        float(link.find("inertial").find("mass").get("value"))
+        for link in urdf_root.iter("link")
+        if link.find("inertial") is not None
+    )
+    assert abs(urdf_mass - total) < 0.02, f"URDF mass {urdf_mass:.4f} != MJCF mass {total:.4f}"
+
+    urdf_revolute = [
+        j.get("name") for j in urdf_root.iter("joint") if j.get("type") == "revolute"
+    ]
+    assert len(urdf_revolute) == 29, f"URDF has {len(urdf_revolute)} revolute joints, expected 29"
+    mjcf_hinges = {
+        mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, j)
+        for j in range(m.njnt)
+        if m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE
+    }
+    assert set(urdf_revolute) == mjcf_hinges, "URDF/MJCF actuated joint sets differ"
+
     print(f"verify OK: 29 dof, 29 actuators, mass {total:.4f} kg, nbody={m.nbody}, "
-          f"ncon@default={d.ncon}, no self-penetration")
+          f"ncon@default={d.ncon}, no self-penetration; "
+          f"URDF parity: {len(urdf_bodies)} bodies, mass {urdf_mass:.4f} kg")
 
 
 if __name__ == "__main__":

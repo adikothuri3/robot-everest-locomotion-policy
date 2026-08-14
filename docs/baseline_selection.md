@@ -36,7 +36,14 @@ Decision date: 2026-08-13. Full research notes: `docs/research/`.
 
 ## Decision
 
-### Primary baseline: **Holosoma + FastSAC** (MJWarp backend, WSL2 Ubuntu-24.04)
+### Primary baseline: **Holosoma + FastSAC** (IsaacSim/PhysX backend, cloud)
+
+> **Backend superseded 2026-08-13.** This section chose MJWarp as the backend
+> because it was the only stack that ran locally. It is not training-validated
+> upstream and NaNs under untrained-policy flailing, so the default is now
+> `simulator:isaacsim` (cloud), with MJWarp kept for local smoke. The *trainer*
+> choice (Holosoma + FastSAC) is unchanged. See `notes/decisions.md`.
+
 The hypothesis held. Decisive factors beyond the score:
 - The FastSAC recipe *is* the stability recipe we want: trained **with** rough terrain, pushes, heavy DR and an action-rate curriculum, and validated on two real humanoids.
 - MJWarp backend runs on this machine's WSL2 (Ubuntu 24.04 + Python 3.12 is an officially supported combo; driver OK) — the only modern GPU-parallel training stack that does.

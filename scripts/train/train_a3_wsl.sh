@@ -1,24 +1,74 @@
 #!/bin/bash
-# Train A3 Ultra locomotion with Holosoma inside WSL2.
+# Train an A3 Ultra policy with Holosoma inside WSL2.
 #
-# Usage (from Windows):  wsl -d Ubuntu-24.04 -- bash scripts/train/train_a3_wsl.sh [fastsac|ppo] [extra args...]
-# Usage (inside WSL):    bash scripts/train/train_a3_wsl.sh fastsac --training.num_envs 1024
-set -e
+# Backend default is IsaacSim (PhysX) — the training-validated backend for this
+# project (notes/decisions.md). MJWarp is smoke-only: it NaNs under untrained-
+# policy flailing. Override with SIMULATOR=mjwarp for short local smoke runs.
+#
+# Caveat: IsaacSim is not supported inside WSL2 on consumer setups, so the
+# isaacsim path here only works if holosoma's `hssim` conda env was actually
+# built. Real IsaacSim runs go to the cloud: scripts/cloud/train_a3_cloud.sh.
+#
+# Usage (from Windows):
+#   wsl -d Ubuntu-24.04 -- env bash scripts/train/train_a3_wsl.sh [fastsac|ppo|getup] [extra args...]
+#   wsl -d Ubuntu-24.04 -- env SIMULATOR=mjwarp bash scripts/train/train_a3_wsl.sh fastsac --training.num_envs 256
+# Usage (inside WSL):
+#   bash scripts/train/train_a3_wsl.sh fastsac --training.num_envs 1024
+set -euo pipefail
 
-ALGO="${1:-fastsac}"
+TASK="${1:-fastsac}"
 shift || true
 
-REPO_WIN=/mnt/c/Users/Aditya/VSCode/robot-everest-locomotion-policy
-IMPORT_FILE=$REPO_WIN/src/everest_locomotion/holosoma_ext/a3_ultra_presets.py
+SIMULATOR="${SIMULATOR:-isaacsim}"
+HOLOSOMA_DIR="${HOLOSOMA_DIR:-$HOME/holosoma}"
+# Repo root, resolved from this script (works from any cwd, Windows or WSL side).
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+IMPORT_FILE="$REPO_DIR/src/everest_locomotion/holosoma_ext/a3_ultra_presets.py"
 
-case "$ALGO" in
+case "$TASK" in
   fastsac) EXP="a3-ultra-fast-sac" ;;
   ppo)     EXP="a3-ultra-ppo" ;;
-  *) echo "unknown algo: $ALGO (use fastsac|ppo)"; exit 1 ;;
+  everest) EXP="a3-ultra-fast-sac-everest" ;;
+  getup)
+    EXP="a3-ultra-getup"
+    IMPORT_FILE="$REPO_DIR/src/everest_locomotion/holosoma_ext/getup_presets.py"
+    ;;
+  *) echo "unknown task: $TASK (use fastsac|ppo|everest|getup)"; exit 1 ;;
 esac
 
-cd ~/holosoma
-source .venv/hsmujoco/bin/activate
-exec python src/holosoma/holosoma/train_agent.py "exp:$EXP" simulator:mjwarp \
+# The presets resolve the asset directory from here; the get-up task also needs
+# `everest_locomotion` importable for its env_class / reward terms.
+export EVEREST_A3_ASSET_ROOT="$REPO_DIR/assets/a3_ultra/holosoma"
+export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+
+cd "$HOLOSOMA_DIR"
+
+case "$SIMULATOR" in
+  isaacsim)
+    # holosoma's setup_isaacsim.sh drops its sentinel in $HOME/.holosoma_deps
+    # (scripts/source_common.sh WORKSPACE_DIR), not in the repo.
+    SENTINEL="${HOLOSOMA_WORKSPACE:-$HOME/.holosoma_deps}/.env_setup_finished_${CONDA_ENV_NAME:-hssim}"
+    if [[ ! -f "$SENTINEL" ]]; then
+      cat >&2 <<EOF
+ERROR: no IsaacSim env ($SENTINEL missing).
+IsaacSim is the default backend but is not supported in WSL2 on consumer setups.
+  * real training  -> cloud: bash scripts/cloud/train_a3_cloud.sh   (SIMULATOR=isaacsim)
+  * local smoke    -> SIMULATOR=mjwarp bash scripts/train/train_a3_wsl.sh $TASK ...
+  * try anyway     -> bash $HOLOSOMA_DIR/scripts/setup_isaacsim.sh, then re-run
+EOF
+      exit 1
+    fi
+    # shellcheck disable=SC1091
+    source scripts/source_isaacsim_setup.sh
+    ;;
+  mjwarp)
+    echo "WARNING: MJWarp is smoke-only (NaNs under untrained flailing) — not for real runs." >&2
+    # shellcheck disable=SC1091
+    source .venv/hsmujoco/bin/activate
+    ;;
+  *) echo "unknown simulator: $SIMULATOR (use isaacsim|mjwarp)"; exit 1 ;;
+esac
+
+exec python src/holosoma/holosoma/train_agent.py "exp:$EXP" "simulator:$SIMULATOR" \
   --import-file "$IMPORT_FILE" \
   "$@"

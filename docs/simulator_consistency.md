@@ -5,9 +5,15 @@ the one it is evaluated on. Three simulators are in play:
 
 | Simulator | Role | Asset used |
 | --- | --- | --- |
-| MJWarp (Holosoma, WSL2) | training | `assets/a3_ultra/holosoma/a3_ultra_29dof.xml` |
-| MuJoCo classic (Windows) | validation / stability suite | same XML (identical by construction) |
-| Isaac Sim/PhysX (Isaac Lab) | secondary training / cross-physics eval | `a3_ultra_29dof.urdf` (converted) |
+| Isaac Sim/PhysX (Holosoma `simulator:isaacsim`) | **training — the default backend** | `a3_ultra_29dof.urdf` (auto-converted) |
+| Isaac Lab (Windows, `.venv-isaac`) | PhysX-side articulation validation (`make check-isaac`) | same URDF |
+| MuJoCo classic (Windows) | independent-physics gate / stability suite | `assets/a3_ultra/holosoma/a3_ultra_29dof.xml` |
+| MJWarp (Holosoma, WSL2) | local smoke runs only (`SIMULATOR=mjwarp`) | same XML (identical by construction) |
+
+Since training moved to the IsaacSim backend, the train→eval pair is
+URDF (PhysX) → XML (MuJoCo), i.e. the comparison below is no longer a
+nice-to-have: it is the only thing tying the trained robot to the evaluated one.
+Re-run it after every asset regeneration.
 
 ## Automated comparison
 ```powershell

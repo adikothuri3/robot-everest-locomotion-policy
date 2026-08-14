@@ -9,8 +9,9 @@ strongest starting point for extremely robust locomotion, and how far can we
 specialize it toward alpine terrain without sacrificing balance and recovery?*
 
 ## Current baseline (see `docs/baseline_selection.md`)
-- **Primary: [Holosoma](https://github.com/amazon-far/holosoma) + FastSAC** (MJWarp backend, runs in WSL2). Rough terrain + pushes + heavy domain randomization, hardware-validated recipe, Apache-2.0.
-- **Fallback: Isaac Lab 2.3 + RSL-RL PPO** rough-terrain config (native Windows).
+- **Primary: [Holosoma](https://github.com/amazon-far/holosoma) + FastSAC on the IsaacSim (PhysX) backend** — the default simulator for every preset and script. Rough terrain + pushes + heavy domain randomization, hardware-validated recipe, Apache-2.0.
+- **Isaac Lab 2.3 + RSL-RL PPO** (native Windows, `.venv-isaac`) — same PhysX physics; validation leg and trainer fallback.
+- **MuJoCo / MJWarp: validation and smoke only** — MuJoCo classic runs the stability suite and sim2sim gate; MJWarp is short local smoke runs only (NaNs under untrained flailing). See `notes/decisions.md`.
 - **References: AGIBOT X1 stack conventions, Humanoid-Gym sim2sim methodology** (docs only — legacy Isaac Gym, not runnable here).
 
 ## Quickstart
@@ -34,7 +35,7 @@ py -3.11 -m venv .venv
 .venv\Scripts\python -m pytest -q          # manifest/adapter/terrain tests
 ```
 
-### 3. Set up Holosoma (WSL2) and reproduce upstream (E00)
+### 3. Set up Holosoma (WSL2 = the MJWarp smoke env) and reproduce upstream (E00)
 ```bash
 # inside WSL2 Ubuntu-24.04
 git clone https://github.com/amazon-far/holosoma ~/holosoma
@@ -49,10 +50,13 @@ python src/holosoma/holosoma/train_agent.py exp:g1-29dof-fast-sac simulator:mjwa
 **Cloud (recommended — local wall-clock is ~30 s/iter):** on a Linux GPU box,
 `bash scripts/cloud/train_a3_cloud.sh` — fully pinned and self-verifying; see
 `docs/cloud_training.md`.
+The default backend everywhere is `simulator:isaacsim`; MJWarp must be asked for
+explicitly.
 ```powershell
-# local smoke runs (WSL2); NOTE: install the pinned mujoco_warp first
-# (scripts/setup/wsl_pin_mjwarp.sh) — PyPI mujoco-warp 3.11.0 breaks physics
-wsl -d Ubuntu-24.04 -- bash scripts/train/train_a3_wsl.sh fastsac --training.num_envs 512
+# local smoke runs (WSL2, MJWarp — IsaacSim is not supported inside WSL2).
+# NOTE: install the pinned mujoco_warp first (scripts/setup/wsl_pin_mjwarp.sh)
+# — PyPI mujoco-warp 3.11.0 breaks physics
+wsl -d Ubuntu-24.04 -- env SIMULATOR=mjwarp bash scripts/train/train_a3_wsl.sh fastsac --training.num_envs 512
 # variants: ppo | fastsac; Everest stability reward: exp:a3-ultra-fast-sac-everest
 ```
 
@@ -100,8 +104,9 @@ terrain → E06 Everest stability reward (`a3-ultra-fast-sac-everest`) → E07 P
 FastSAC → E08 cross-physics eval → E09 strong terrain+DR → E10 alpine curriculum.
 
 ## Sim-to-sim validation
-Train in MJWarp → evaluate in MuJoCo classic (`stability_suite.py`) → later PhysX via
-Isaac Lab. Model-property consistency: `scripts/diagnostics/dump_model_properties.py`
+Train in IsaacSim/PhysX → evaluate in MuJoCo classic (`stability_suite.py`), the
+independent-physics gate → Isaac Lab for PhysX-side articulation checks
+(`make check-isaac`). Model-property consistency: `scripts/diagnostics/dump_model_properties.py`
 + `compare_sim_properties.py` (see `docs/simulator_consistency.md`).
 
 ## Known limitations

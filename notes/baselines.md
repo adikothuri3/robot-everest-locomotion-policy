@@ -16,8 +16,9 @@ What this project is built on, what it is deliberately **not**, and the measured
 
 ## Training stack
 
-- **Primary: Holosoma + FastSAC** (MJWarp backend, WSL2 `~/holosoma`). Its recipe already contains our stability ingredients: rough terrain + pushes + heavy DR + action-rate curriculum; hardware-validated; Apache-2.0. A3 experiments via `--import-file` presets: `a3-ultra-fast-sac`, `a3-ultra-ppo`, `a3-ultra-fast-sac-everest`.
-- **Fallback: Isaac Lab 2.3 + RSL-RL PPO** (native Windows, `.venv-isaac`) — also the cross-physics validation leg.
+- **Primary: Holosoma + FastSAC on the IsaacSim (PhysX) backend** — `simulator:isaacsim` is the registered default in the presets, `scripts/train/train_a3_wsl.sh`, and `scripts/cloud/train_a3_cloud.sh` ([[decisions]]). Its recipe already contains our stability ingredients: rough terrain + pushes + heavy DR + action-rate curriculum; hardware-validated; Apache-2.0. A3 experiments via `--import-file` presets: `a3-ultra-fast-sac`, `a3-ultra-ppo`, `a3-ultra-fast-sac-everest`.
+- **Isaac Lab 2.3 + RSL-RL PPO** (native Windows, `.venv-isaac`) — same PhysX physics as the trainer: the articulation/consistency validation leg (`make check-isaac`) and the trainer fallback if Holosoma stalls.
+- **MuJoCo / MJWarp — validation and smoke only.** MuJoCo classic is the independent-physics gate (stability suite, sim2sim); MJWarp is short local smoke runs only. Its pinned stack (mujoco_warp `ecaef88`) still matters for that path — see [[setup]].
 - **Reference-only: AGIBOT X1 stack, Humanoid-Gym sim2sim** (legacy Isaac Gym; X1 has no license — ideas only, no code reuse).
 - **Get-up recipe: HoST** (multi-critic PPO, ~350 N pull-force curriculum annealed, action-rescaler β 1.0→0.25, L2C2 smoothness), reimplemented as a Holosoma extension; HumanUP 8× slow-down as smoothness fallback. Scorecard: `docs/research/getup_recipes.md`.
 - **Compute: cloud for training, local for validation.** Local FastSAC is ~11–30 s/iteration; `scripts/cloud/train_a3_cloud.sh` is fully pinned and self-verifying. Local machine runs the stability suite and sim2sim gates.
@@ -26,7 +27,8 @@ What this project is built on, what it is deliberately **not**, and the measured
 
 - **Robot truth:** `configs/robots/a3_ultra.yaml` — joint order legs (L,R) → waist → arms (L,R) → head; official vs ASSUMED values (PD gains, armature, default pose) explicitly separated.
 - **Training asset:** `assets/a3_ultra/holosoma/a3_ultra_29dof.xml` is **generated** by `scripts/convert/make_holosoma_asset.py` (v4: full-body primitive collision boxes, lying keyframes). Never edit by hand; regenerate.
-- **Critical pin:** mujoco_warp git `ecaef88` (3.10.0) with holosoma `6e146b0`. PyPI mujoco-warp 3.11.0 **breaks physics** (NaN, 1e12 velocities) — see [[setup]].
+- **Default simulator:** `isaacsim`. Anything that runs MJWarp must pass `simulator:mjwarp` (or `SIMULATOR=mjwarp`) explicitly and is a smoke run by definition.
+- **Critical pin (MJWarp path only):** mujoco_warp git `ecaef88` (3.10.0) with holosoma `6e146b0`. PyPI mujoco-warp 3.11.0 **breaks physics** (NaN, 1e12 velocities) — see [[setup]].
 
 ## Measured floors (the numbers to beat)
 

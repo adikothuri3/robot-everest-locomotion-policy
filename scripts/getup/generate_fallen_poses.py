@@ -116,9 +116,18 @@ def generate(model_path: Path, out_dir: Path, num: int, seed: int) -> dict:
         arr = np.array(banks[cat]) if banks[cat] else np.zeros((0, m.nq))
         np.save(out_dir / f"fallen_poses_{cat}.npy", arr)
         counts[cat] = len(arr)
+    hinge_names = [
+        mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, j)
+        for j in range(m.njnt)
+        if m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE
+    ]
     meta = {
         "model": str(model_path.relative_to(REPO)),
         "nq": int(m.nq),
+        # MJCF kinematic-TREE order (waist subtree first) — NOT the canonical
+        # actuator order from configs/robots/a3_ultra.yaml. Consumers MUST
+        # remap by name. Base quat is MuJoCo wxyz.
+        "hinge_joint_names_tree_order": hinge_names,
         "num_requested": num,
         "seed": seed,
         "drop_height_m": DROP_HEIGHT,

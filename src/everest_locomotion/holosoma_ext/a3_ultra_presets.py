@@ -1,10 +1,14 @@
 """Holosoma `--import-file` presets for the AgiBot A3 Ultra (29-DOF locomotion).
 
-Usage (inside the Holosoma env, e.g. WSL2):
-    python src/holosoma/holosoma/train_agent.py exp:a3-ultra-fast-sac simulator:mjwarp \
+Usage (inside the Holosoma env, e.g. the IsaacSim conda env):
+    python src/holosoma/holosoma/train_agent.py exp:a3-ultra-fast-sac \
         --import-file /mnt/c/Users/Aditya/VSCode/robot-everest-locomotion-policy/src/everest_locomotion/holosoma_ext/a3_ultra_presets.py
 
 Design notes:
+- Simulator: every preset defaults to `simulator.isaacsim` (PhysX) — the backend
+  holosoma's own nightly matrix training-validates. Append `simulator:mjwarp` on
+  the CLI for short local smoke runs only (MJWarp NaNs under untrained flailing;
+  see notes/decisions.md).
 - Joint naming: identical convention to Unitree G1 29-DOF (verified), so all
   G1 locomotion presets (observation/action/termination/randomization/command/
   curriculum/reward) are robot-agnostic and reused unmodified. Only the
@@ -232,7 +236,7 @@ a3_ultra_fast_sac = EXPERIMENT_REGISTRY.add(
         g1_29dof_fast_sac,
         training=TrainingConfig(project="everest-a3", name="a3_ultra_fast_sac"),
         robot=a3_ultra_29dof,
-        simulator=simulator.mjwarp,
+        simulator=simulator.isaacsim,
     ),
 )
 
@@ -242,7 +246,7 @@ a3_ultra_ppo = EXPERIMENT_REGISTRY.add(
         g1_29dof,
         training=TrainingConfig(project="everest-a3", name="a3_ultra_ppo"),
         robot=a3_ultra_29dof,
-        simulator=simulator.mjwarp,
+        simulator=simulator.isaacsim,
     ),
 )
 

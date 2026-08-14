@@ -19,8 +19,12 @@ Windows 11 Home, Ryzen 7 5700 (8C/16T), 16 GB RAM, **RTX 4060 Ti 8 GB**, driver 
 | Environment | Contents |
 | --- | --- |
 | `.venv/` (Windows, py3.11) | mujoco 3.11.0, numpy, pytest, imageio+ffmpeg, this package editable |
-| `.venv-isaac/` (Windows, py3.11) | Isaac Sim 5.1.0 (pip), Isaac Lab v2.3.0 editable, RSL-RL 3.0.1, torch 2.7.0+cu |
-| WSL2 `~/holosoma/.venv/hsmujoco` (py3.12) | Holosoma @ `6e146b0`, **mujoco_warp git `ecaef88` (pinned — PyPI 3.11.0 breaks physics)**, warp-lang 1.16.0, torch 2.13.0+cu130 |
+| `.venv-isaac/` (Windows, py3.11) | Isaac Sim 5.1.0 (pip), Isaac Lab v2.3.0 editable, RSL-RL 3.0.1, torch 2.7.0+cu — the PhysX validation leg |
+| WSL2 `~/holosoma/.venv/hsmujoco` (py3.12) | Holosoma @ `6e146b0`, **mujoco_warp git `ecaef88` (pinned — PyPI 3.11.0 breaks physics)**, warp-lang 1.16.0, torch 2.13.0+cu130 — MJWarp **smoke only** |
+| cloud instance, conda `hssim` | Holosoma @ `6e146b0` + IsaacSim (`scripts/setup_isaacsim.sh`) — where the default `simulator:isaacsim` actually runs |
+
+> [!warning] IsaacSim is the default backend but has no local home
+> IsaacSim is not supported inside WSL2 on consumer setups, and this box is under Isaac Lab's 16 GB VRAM minimum. `scripts/train/train_a3_wsl.sh` therefore defaults to `isaacsim` and **fails with instructions** unless a `hssim` conda env exists; local runs need `SIMULATOR=mjwarp` (smoke) and real runs go to the cloud. See [[decisions]].
 
 ## Standing quirks
 
@@ -33,8 +37,8 @@ Windows 11 Home, Ryzen 7 5700 (8C/16T), 16 GB RAM, **RTX 4060 Ti 8 GB**, driver 
 ## Smoke commands
 
 ```
-make check-model   # MuJoCo A3 diagnostics (12 checks)
-make test          # pytest (manifest/adapter/terrain)
-make check-isaac   # Isaac Lab headless + cross-sim comparison
-wsl -d Ubuntu-24.04 -- bash scripts/train/train_a3_wsl.sh fastsac --training.num_envs 512
+make check-isaac      # Isaac Lab / PhysX headless + cross-sim comparison (primary sim leg)
+make check-model      # MuJoCo A3 diagnostics (12 checks, independent-physics gate)
+make test             # pytest (manifest/adapter/terrain)
+make train-a3-smoke   # local MJWarp smoke run (SIMULATOR=mjwarp, 256 envs)
 ```

@@ -1,9 +1,12 @@
 """A3 Ultra Isaac Lab validation — PASS/FAIL checks (headless).
 
-Loads the generated 29-DOF URDF through Isaac Lab's URDF importer on GPU
-(PhysX), verifies articulation structure against the canonical manifest, PD
-holds the default pose, and writes results/consistency/isaac.json for the
-cross-sim comparison.
+IsaacSim/PhysX is the default training backend, so this is the pre-flight for a
+cloud run: it imports the generated 29-DOF URDF with the SAME converter settings
+Holosoma uses (`merge_fixed_joints` / `replace_cylinders_with_capsules` from
+`RobotAssetConfig`), then checks the resulting articulation against the canonical
+manifest AND against the preset's `body_names` — the list Holosoma asserts on at
+startup. It PD-holds the default pose and writes results/consistency/isaac.json
+for the cross-sim comparison.
 
 Run inside the Isaac venv:
     .venv-isaac/Scripts/python.exe scripts/diagnostics/check_isaac_a3.py
@@ -34,6 +37,17 @@ import yaml  # noqa: E402
 RESULTS: list[tuple[str, bool, str]] = []
 
 
+def _preset_body_names() -> list[str]:
+    """BODY_NAMES literal from the Holosoma preset (parsed, so holosoma need not import)."""
+    import ast
+
+    src = (REPO / "src/everest_locomotion/holosoma_ext/a3_ultra_presets.py").read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "BODY_NAMES":
+            return ast.literal_eval(node.value)
+    raise AssertionError("BODY_NAMES not found in a3_ultra_presets.py")
+
+
 def check(name: str, ok: bool, detail: str = "") -> bool:
     RESULTS.append((name, ok, detail))
     print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
@@ -58,7 +72,11 @@ def main() -> int:
         spawn=sim_utils.UrdfFileCfg(
             asset_path=str(urdf),
             fix_base=False,
-            merge_fixed_joints=False,
+            # must mirror a3_ultra_presets.RobotAssetConfig — Holosoma passes
+            # collapse_fixed_joints / replace_cylinder_with_capsule straight
+            # through to this converter.
+            merge_fixed_joints=True,
+            replace_cylinders_with_capsules=True,
             joint_drive=UrdfConverterCfg.JointDriveCfg(
                 gains=UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0.0, damping=0.0),
                 target_type="none",
@@ -100,6 +118,17 @@ def main() -> int:
         "29 actuated joints match manifest",
         sorted(robot.joint_names) == sorted(control_joints),
         f"{len(robot.joint_names)} joints",
+    )
+
+    # The Holosoma IsaacSim backend asserts num_bodies == len(body_names) and
+    # resolves every name; a mismatch here is a crash on the cloud box.
+    preset_bodies = _preset_body_names()
+    got, want = set(robot.body_names), set(preset_bodies)
+    check(
+        "articulation bodies match preset body_names",
+        got == want,
+        f"{len(got)} bodies"
+        + ("" if got == want else f"; missing={sorted(want - got)[:4]} extra={sorted(got - want)[:4]}"),
     )
 
     masses = robot.data.default_mass[0].cpu().numpy()

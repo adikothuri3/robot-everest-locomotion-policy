@@ -1,0 +1,139 @@
+#!/bin/bash
+# =============================================================================
+# Turnkey cloud training: AgiBot A3 Ultra GET-UP policy (Holosoma PPO, IsaacSim)
+# =============================================================================
+# Run this ON a fresh Linux GPU instance (Lambda Cloud: Ubuntu 22.04, NVIDIA
+# driver preinstalled; 24 GB VRAM recommended: A10, L40S, RTX 6000 Ada, A100).
+#
+#   git clone <this-repo-url> everest && cd everest
+#   bash scripts/cloud/train_a3_getup_cloud.sh
+#
+# Environment overrides:
+#   EXP=a3-ultra-getup            (PPO, HoST-parity default)
+#      |a3-ultra-getup-fast-sac   (FastSAC — the repo's proven locomotion algo)
+#   NUM_ENVS=4096   ITERATIONS=20000   SEED=1
+#   WANDB_API_KEY=...           (optional; enables logger:wandb)
+#
+# What this trains (see docs/research/getup_recipes.md and the getup extension
+# src/everest_locomotion/holosoma_ext/a3_ultra_getup.py):
+#   HoST-style get-up adapted to Holosoma: fallen-pose starts from the
+#   drop-and-settle bank (assets/a3_ultra/getup/), staged rewards
+#   (upright -> rise -> locomotion default pose -> stand still), 350 N assist
+#   force on the torso annealed to zero by held-stand success rate, smoothness
+#   penalties ramped in by PenaltyCurriculum, velocity-blowup terminations,
+#   NO contact termination (ground contact is the task).
+#   Success = holding the locomotion handoff pose 2 s (manifest getup.terminal).
+#
+# Backend: IsaacSim ONLY for real runs — holosoma's nightly matrix validates
+# [isaacgym, isaacsim]; MJWarp NaNs under untrained-policy flailing and get-up
+# is maximal flailing. (Local MJWarp = smoke tests only.)
+#
+# Watch during training (TensorBoard: logs/everest-a3/<run>/):
+#   Episode/getup_success_rate  -> the metric that matters (target: >0.9)
+#   Episode/getup_assist_scale  -> must anneal 1.0 -> 0.0 (success without
+#                                  assist is the only success that counts)
+#   Episode/penalty_scale       -> smoothness ramp (0.1 -> 1.0)
+#   average_episode_length      -> ~500 (=10 s) once flailing stops
+# A policy is only DONE when: success_rate > 0.9 AND assist_scale == 0.0
+# AND penalty_scale == 1.0.
+# =============================================================================
+set -euo pipefail
+
+EXP="${EXP:-a3-ultra-getup}"
+NUM_ENVS="${NUM_ENVS:-4096}"
+ITERATIONS="${ITERATIONS:-20000}"
+SEED="${SEED:-1}"
+HOLOSOMA_COMMIT="6e146b0af5d7cd8a39b8bb2ed05b977cf70445d3"
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+WORK="${WORK:-$HOME}"
+
+echo "== [1/6] Sanity =="
+command -v nvidia-smi >/dev/null || { echo "ERROR: no NVIDIA driver"; exit 1; }
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+test -f "$REPO_DIR/assets/a3_ultra/holosoma/a3_ultra_29dof.urdf" || {
+  echo "ERROR: generated A3 asset missing; regenerate with scripts/convert/make_holosoma_asset.py"; exit 1; }
+test -f "$REPO_DIR/assets/a3_ultra/getup/fallen_poses_meta.json" || {
+  echo "ERROR: fallen-pose bank missing (assets/a3_ultra/getup). It is committed to"
+  echo "the repo; if absent regenerate with scripts/getup/generate_fallen_poses.py"
+  exit 1
+}
+python3 - "$REPO_DIR" <<'EOF'
+import json, sys, pathlib
+meta = json.loads((pathlib.Path(sys.argv[1]) / "assets/a3_ultra/getup/fallen_poses_meta.json").read_text())
+n = sum(meta["counts"].values())
+assert n >= 1000, f"pose bank too small: {n}"
+assert "hinge_joint_names_tree_order" in meta, "pose bank meta missing joint names — regenerate"
+print(f"pose bank OK: {n} poses, categories {meta['counts']}")
+EOF
+
+echo "== [2/6] Clone holosoma @ ${HOLOSOMA_COMMIT:0:7} =="
+if [[ ! -d "$WORK/holosoma" ]]; then
+  git clone https://github.com/amazon-far/holosoma.git "$WORK/holosoma"
+fi
+git -C "$WORK/holosoma" fetch --all --quiet || true
+git -C "$WORK/holosoma" checkout -q "$HOLOSOMA_COMMIT"
+cd "$WORK/holosoma"
+
+echo "== [3/6] IsaacSim environment (conda env hssim) =="
+if ! command -v conda >/dev/null; then
+  echo "installing Miniforge..."
+  curl -fsSL -o /tmp/miniforge.sh \
+    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
+  bash /tmp/miniforge.sh -b -p "$HOME/miniforge3"
+  # shellcheck disable=SC1091
+  source "$HOME/miniforge3/etc/profile.d/conda.sh"
+  conda init bash >/dev/null
+else
+  CONDA_BASE=$(conda info --base)
+  # shellcheck disable=SC1091
+  source "$CONDA_BASE/etc/profile.d/conda.sh"
+fi
+bash scripts/setup_isaacsim.sh
+# shellcheck disable=SC1091
+source scripts/source_isaacsim_setup.sh
+
+echo "== [4/6] Verify stack + config resolution =="
+python - <<'EOF'
+import torch
+assert torch.cuda.is_available(), "CUDA not available in torch"
+print("torch", torch.__version__, "| cuda", torch.version.cuda)
+EOF
+export EVEREST_A3_ASSET_ROOT="$REPO_DIR/assets/a3_ultra/holosoma"
+export EVEREST_A3_GETUP_POSES="$REPO_DIR/assets/a3_ultra/getup"
+python - "$REPO_DIR" <<'EOF'
+import sys
+from holosoma.utils.config_registry import load_file_presets
+load_file_presets([sys.argv[1] + "/src/everest_locomotion/holosoma_ext/a3_ultra_getup.py"])
+import everest_getup
+exp = everest_getup.a3_ultra_getup
+assert exp.env_class == "everest_getup.A3UltraGetupManager"
+assert exp.simulator.config.sim.max_episode_length_s == 10.0
+print("getup experiment config resolves OK:", sorted(exp.reward.terms))
+EOF
+
+echo "== [5/6] Train: $EXP  sim=isaacsim envs=$NUM_ENVS iters=$ITERATIONS seed=$SEED =="
+LOGGER_ARGS=()
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+  LOGGER_ARGS=(logger:wandb)
+  echo "wandb enabled"
+fi
+python src/holosoma/holosoma/train_agent.py "exp:$EXP" "${LOGGER_ARGS[@]}" \
+  --import-file "$REPO_DIR/src/everest_locomotion/holosoma_ext/a3_ultra_getup.py" \
+  --training.num_envs "$NUM_ENVS" \
+  --training.seed "$SEED" \
+  --algo.config.num_learning_iterations "$ITERATIONS" \
+  --algo.config.save_interval 2000
+
+echo "== [6/6] Collect artifacts =="
+RUN_DIR=$(ls -dt "$WORK"/holosoma/logs/everest-a3/*/ | head -1)
+OUT="$REPO_DIR/checkpoints/cloud_getup_$(basename "$RUN_DIR")"
+mkdir -p "$OUT"
+cp "$RUN_DIR"/model_*.pt "$RUN_DIR"/model_*.onnx "$RUN_DIR"/holosoma_config.yaml "$OUT"/ 2>/dev/null || true
+cp "$RUN_DIR"/events.out.tfevents.* "$OUT"/ 2>/dev/null || true
+echo "artifacts in: $OUT"
+echo "retrieve with: scp -r <instance>:$OUT ./checkpoints/"
+echo
+echo "Next (locally): cross-physics gate in MuJoCo classic:"
+echo "  python scripts/eval/stability_suite.py --policy onnx --onnx checkpoints/<run>/model_*.onnx"
+echo "then the chained get-up -> locomotion handoff test (E14)."

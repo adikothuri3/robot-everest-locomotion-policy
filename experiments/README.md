@@ -1,8 +1,12 @@
 # Experiment ladder
 
-All Holosoma commands run inside WSL2 (`wsl -d Ubuntu-24.04 -- bash ...`) with the
-env activated (`source ~/holosoma/.venv/hsmujoco/bin/activate`) or via
-`scripts/train/train_a3_wsl.sh`. `IMPORT=--import-file /mnt/c/Users/Aditya/VSCode/robot-everest-locomotion-policy/src/everest_locomotion/holosoma_ext/a3_ultra_presets.py`.
+Real runs go to the cloud (`scripts/cloud/train_a3_cloud.sh`) on the default
+**`simulator:isaacsim`** backend — the command cores below inherit it from the
+presets, so no `simulator:` token means IsaacSim. Local smoke runs go through
+WSL2 (`wsl -d Ubuntu-24.04 -- env SIMULATOR=mjwarp bash scripts/train/train_a3_wsl.sh ...`,
+env `source ~/holosoma/.venv/hsmujoco/bin/activate`) and are MJWarp-only; treat
+their numbers as pipeline checks, not results.
+`IMPORT=--import-file /mnt/c/Users/Aditya/VSCode/robot-everest-locomotion-policy/src/everest_locomotion/holosoma_ext/a3_ultra_presets.py`.
 
 Guideline for this 8 GB GPU: `--training.num_envs 512–1024` (G1 smoke used 512 at
 ~3.8 GB VRAM). Every run records: git commit (log it in the run notes), seed,
@@ -32,10 +36,25 @@ links are now contact-capable, so "hip" termination fires slightly earlier on
 falls. Watch nefc counters on the first v5 locomotion run
 (`contact_pairs_multiplier=16` in presets should still be ample).
 
+Local MJWarp smoke findings (2026-08-13, this machine):
+- Lying poses need a bigger constraint budget than locomotion: pass
+  `--simulator.config.mujoco_warp.njmax_per_env 1024` for get-up smoke runs
+  (default None overflowed at ~670; 768 still saw one 857 frame; 64 envs).
+- Working smoke command (5/5 iterations + checkpoint, 2026-08-13):
+  `exp:a3-ultra-getup-fast-sac simulator:mjwarp $GETUP --training.num_envs 64
+  --algo.config.num_learning_iterations 5
+  --simulator.config.sim.max_episode_length_s 10
+  --simulator.config.mujoco_warp.njmax_per_env 1024`
+- **PPO + MJWarp NaNs locally even for plain locomotion** (`a3-ultra-ppo`, 64
+  envs, upstream recipe, zero get-up code: "normal expects std >= 0" in the
+  first update). FastSAC survives. So local smoke of any PPO experiment is
+  impossible on MJWarp — use `a3-ultra-getup-fast-sac` for smoke, IsaacSim for
+  every real PPO run. Consistent with the MJWarp-not-training-safe decision.
+
 | ID | Purpose | Command core | Status |
 | --- | --- | --- | --- |
 | E11 | HoST feasibility probe: can 60 kg A3 rise at all? (throwaway, cloud GPU, Isaac Gym) | see `scripts/getup/host_probe/README.md` | scaffold ready; needs cloud GPU + Isaac Gym Preview 4 |
-| E12 | G1 get-up recipe parity in Holosoma (multi-critic + pull-force + β + L2C2 reimplemented; validate on G1 before A3) | new `getup` task via `$IMPORT`-style extension, `simulator:isaacsim` (MJWarp is NOT training-safe — NaNs under untrained flailing, and get-up is maximal flailing; MJWarp smoke runs only) | blocked on E11 learnings + task implementation |
-| E13 | A3 flat get-up (supine/prone/side ≥90% rise; terminal = locomotion default_pose per manifest `getup.terminal`) | `exp:a3-ultra-getup $IMPORT simulator:isaacsim` (to be registered), cloud via `scripts/cloud/train_a3_cloud.sh` | blocked on E12 |
+| E12 | Get-up task implementation in Holosoma (HoST recipe adapted to single-critic: staged rewards, 350 N assist-force curriculum annealed by success rate, PenaltyCurriculum smoothness ramp, pose-bank command-term resets, wrist soft-freeze; full design notes in the extension docstring) | `GETUP=--import-file .../holosoma_ext/a3_ultra_getup.py` → `exp:a3-ultra-getup` (PPO, IsaacSim default) or `exp:a3-ultra-getup-fast-sac` | **done 2026-08-13** — config resolves in holosoma; wiring smoke-validated on MJWarp (env+bank+obs 93/97+rollout OK) |
+| E13 | A3 flat get-up cloud run (supine/prone/side; success = holding locomotion default_pose 2 s per manifest `getup.terminal`; done when success>0.9 AND assist_scale=0 AND penalty_scale=1) | `bash scripts/cloud/train_a3_getup_cloud.sh` on Lambda (EXP=a3-ultra-getup or a3-ultra-getup-fast-sac) | ready — needs Lambda instance |
 | E14 | Get-up→locomotion chained handoff in MuJoCo gate (get-up ONNX → freeze → locomotion ONNX, survive 5 s + 0.3 m/s command) | `scripts/eval/stability_suite.py` chained mode (to be added) | blocked on E13 + a trained locomotion policy (E02+) |
 | E15 | Slope/rough get-up curriculum (0–15°, HiFAR DR: μ→0.1, compliance, under-body obstacles) | E13 + terrain overrides | blocked on E13 |
