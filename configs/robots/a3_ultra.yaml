@@ -122,6 +122,34 @@ control:
   action: joint_position_offset          # assumed (PD position targets, upstream-standard)
   action_scale: 0.25                     # assumed, tune during port
 
+# ---------------------------------------------------------------------
+# Get-up task conventions (project, not hardware). Rationale in
+# docs/research/getup_recipes.md and the approved get-up plan.
+# ---------------------------------------------------------------------
+getup:
+  control_joints_mode: legs_waist_arms     # same 29-DOF set as locomotion
+  # Wrists carry only 6 Nm on a 60 kg robot: never load-bearing. Soft-freeze
+  # during ground phases via a tight action scale (policy still commands them,
+  # but cannot slam them); revisit only if discovered strategies need palms.
+  wrist_action_scale: 0.05                 # vs action_scale 0.25 elsewhere
+  # Head links are welded but their boxes protect prone/side poses; head has
+  # no actuators to protect.
+  # Terminal state = the locomotion policy's expected initial state, so the
+  # handoff is a plain switch. Success requires holding this, not just
+  # "torso vertical".
+  terminal:
+    target_pose: default_pose              # see default_pose below
+    base_height_tol_m: 0.08
+    joint_pos_tol_rad: 0.30                # mean over legs+waist
+    base_lin_vel_max_m_s: 0.25
+    joint_vel_max_rad_s: 1.0
+    hold_time_s: 2.0
+  # During get-up, pelvis/torso ground contact is EXPECTED — the locomotion
+  # termination_contact_bodies convention does not apply. No illegal-contact
+  # termination; hardware-abuse is handled by reward penalties instead.
+  fallen_pose_bank: assets/a3_ultra/getup/  # scripts/getup/generate_fallen_poses.py
+  lying_keyframes: [lying_supine, lying_prone, lying_side_left, lying_side_right]
+
 # PD gains: ASSUMED starting values for simulation only (MJCF ships
 # torque motors with no gains; no official PD spec published). Sized for
 # a 60 kg humanoid using Isaac Lab H1/G1 configs as prior art. Tune.

@@ -110,7 +110,9 @@
                 <geom pos="0.0150035 0.0748998 0.0297029" quat="0.999381 -0.0259018 -0.00888246 -0.022088" type="mesh" rgba="1 1 1 1" mesh="ultra_head_fisheye_camera_left_Link" />
                 <geom pos="0.0150035 -0.0748998 0.0297029" quat="0.999377 0.0259109 -0.00929816 0.0220772" type="mesh" rgba="1 1 1 1" mesh="ultra_head_fisheye_camera_right_Link" />
                 <geom pos="-0.0788452 0 0.0384247" quat="0.997777 0 -0.0666402 0" type="mesh" rgba="1 1 1 1" mesh="ultra_head_fisheye_camera_back_Link" />
+                <geom name="head_pitch_Link_collision_box0" class="collision" type="box" size="0.079626 0.099578 0.120623" pos="0.033182 0.000016 0.029200" quat="0.286214 0.645481 0.648406 0.284615" />
               </body>
+              <geom name="head_yaw_Link_collision_box0" class="collision" type="box" size="0.055835 0.070789 0.095947" pos="0.008245 0.001728 0.166053" quat="0.695643 -0.048354 -0.028773 0.716180" />
             </body>
             <body name="left_shoulder_pitch_Link" pos="0.0303 0.148225 0.283818" quat="0.999048 0.0436194 0 0">
               <inertial pos="0.00096906 0.0547743 0.00016529" quat="0.721275 0.692333 0.0172613 0.0117828" mass="1.01945" diaginertia="0.00117978 0.000989191 0.000956331" />
@@ -141,11 +143,16 @@
                           <joint name="left_wrist_yaw_joint" pos="0 0 0" axis="0 0 1" range="-1.62316 1.62316" actuatorfrcrange="-6 6" actuatorfrclimited="true" damping="1.0" frictionloss="0.1" armature="0.003" />
                           <geom class="visual" type="mesh" rgba="0.85098 0.847059 0.831373 1" mesh="left_wrist_yaw_Link" />
                           <geom class="visual" type="mesh" rgba="0.85098 0.847059 0.831373 1" mesh="left_hand_palm_Link" />
+                          <geom name="left_wrist_yaw_Link_collision_box0" class="collision" type="box" size="0.027998 0.038093 0.037086" pos="0.009991 0.000001 0.000034" quat="0.707093 -0.001240 -0.001200 0.707119" />
+                          <geom name="left_wrist_yaw_Link_collision_box1" class="collision" type="box" size="0.043626 0.045100 0.064657" pos="0.099102 -0.007283 -0.001797" quat="0.500209 0.627424 0.331773 0.496042" />
                         </body>
+                        <geom name="left_wrist_pitch_Link_collision_box0" class="collision" type="box" size="0.026997 0.027000 0.050003" pos="0.022828 0.000628 0.000229" quat="0.000010 0.707314 -0.000010 0.706900" />
                       </body>
+                      <geom name="left_wrist_roll_Link_collision_box0" class="collision" type="box" size="0.037422 0.037661 0.037992" pos="0.048512 0.000628 0.000243" quat="0.500036 0.499991 -0.500017 0.499957" />
                     </body>
                     <geom name="left_elbow_Link_collision_box0" class="collision" type="box" size="0.041304 0.044635 0.090039" pos="0.052154 0.000631 -0.007037" quat="-0.000001 0.729377 0.000034 0.684112" />
                   </body>
+                  <geom name="left_shoulder_yaw_Link_collision_box0" class="collision" type="box" size="0.048407 0.049909 0.087355" pos="0.005155 0.000628 -0.083880" quat="0.706404 -0.028142 -0.028131 0.706689" />
                 </body>
                 <geom name="left_shoulder_roll_Link_collision_box0" class="collision" type="box" size="0.050056 0.061022 0.097917" pos="0.000166 0.005127 -0.052953" quat="0.706602 0.027123 -0.027153 0.706570" />
               </body>
@@ -179,11 +186,16 @@
                           <joint name="right_wrist_yaw_joint" pos="0 0 0" axis="0 0 1" range="-1.62316 1.62316" actuatorfrcrange="-6 6" actuatorfrclimited="true" damping="1.0" frictionloss="0.1" armature="0.003" />
                           <geom class="visual" type="mesh" rgba="0.85098 0.847059 0.831373 1" mesh="right_wrist_yaw_Link" />
                           <geom class="visual" type="mesh" rgba="0.85098 0.847059 0.831373 1" mesh="right_hand_palm_Link" />
+                          <geom name="right_wrist_yaw_Link_collision_box0" class="collision" type="box" size="0.027998 0.038093 0.037086" pos="0.009991 0.000001 0.000034" quat="0.707093 -0.001240 -0.001200 0.707119" />
+                          <geom name="right_wrist_yaw_Link_collision_box1" class="collision" type="box" size="0.043486 0.045401 0.064799" pos="0.099431 0.006601 -0.001329" quat="0.498163 0.327226 0.631206 0.496321" />
                         </body>
+                        <geom name="right_wrist_pitch_Link_collision_box0" class="collision" type="box" size="0.027000 0.027000 0.049998" pos="0.023678 0.000616 0.000083" quat="-0.000202 0.707293 0.000202 0.706920" />
                       </body>
+                      <geom name="right_wrist_roll_Link_collision_box0" class="collision" type="box" size="0.037417 0.037660 0.037992" pos="0.049380 0.000628 0.000097" quat="0.500013 0.499969 -0.500040 0.499978" />
                     </body>
                     <geom name="right_elbow_Link_collision_box0" class="collision" type="box" size="0.041305 0.044635 0.090040" pos="0.053023 0.000631 -0.007191" quat="-0.000004 0.729397 0.000030 0.684090" />
                   </body>
+                  <geom name="right_shoulder_yaw_Link_collision_box0" class="collision" type="box" size="0.048407 0.049860 0.087315" pos="0.005077 0.000626 -0.083922" quat="0.706418 -0.027577 -0.027548 0.706721" />
                 </body>
                 <geom name="right_shoulder_roll_Link_collision_box0" class="collision" type="box" size="0.050039 0.061022 0.097917" pos="0.000163 -0.003854 -0.052954" quat="0.706602 -0.027121 0.027151 0.706570" />
               </body>
@@ -240,7 +252,9 @@
             </body>
             <geom name="left_hip_yaw_Link_collision_box0" class="collision" type="box" size="0.074238 0.072464 0.169504" pos="0.008144 -0.000202 -0.250175" quat="0.999584 -0.000737 -0.022878 -0.017558" />
           </body>
+          <geom name="left_hip_roll_Link_collision_box0" class="collision" type="box" size="0.071481 0.070748 0.071449" pos="0.000176 -0.000291 -0.013827" quat="0.498377 0.501494 0.498527 0.501593" />
         </body>
+        <geom name="left_hip_pitch_Link_collision_box0" class="collision" type="box" size="0.068389 0.064172 0.094016" pos="0.000241 -0.011633 -0.017263" quat="0.951850 0.306525 -0.004247 0.002522" />
       </body>
       <body name="right_hip_pitch_Link" pos="0 -0.122983 -0.178753" quat="0.991445 0.130526 0 0">
         <inertial pos="0.00721166 -0.00459403 -0.0364441" quat="0.9553 -0.291636 -0.029918 0.0381367" mass="1.87346" diaginertia="0.0036045 0.00306023 0.00206222" />
@@ -290,7 +304,9 @@
             </body>
             <geom name="right_hip_yaw_Link_collision_box0" class="collision" type="box" size="0.074074 0.072485 0.169446" pos="0.009472 0.001181 -0.250151" quat="0.999660 -0.000265 -0.022560 0.013033" />
           </body>
+          <geom name="right_hip_roll_Link_collision_box0" class="collision" type="box" size="0.071481 0.070749 0.071452" pos="0.001274 0.001552 -0.013830" quat="0.501512 0.498390 0.501609 0.498480" />
         </body>
+        <geom name="right_hip_pitch_Link_collision_box0" class="collision" type="box" size="0.068389 0.064172 0.094054" pos="-0.000008 0.012808 -0.017538" quat="0.952394 -0.304836 0.004413 0.001213" />
       </body>
       <geom name="pelvis_link_collision_box0" class="collision" type="box" size="0.080832 0.087734 0.099765" pos="-0.002202 0.000616 -0.131026" quat="0.999698 -0.000106 -0.024553 0.000947" />
     </body>
@@ -463,5 +479,17 @@
     <exclude body1="right_knee_Link" body2="right_ankle_roll_Link" />
     <exclude body1="left_ankle_pitch_Link" body2="left_ankle_roll_Link" />
     <exclude body1="right_ankle_pitch_Link" body2="right_ankle_roll_Link" />
+    <exclude body1="left_hip_pitch_Link" body2="left_hip_yaw_Link" />
+    <exclude body1="left_hip_pitch_Link" body2="torso_Link" />
+    <exclude body1="left_hip_roll_Link" body2="pelvis_link" />
+    <exclude body1="pelvis_link" body2="right_hip_roll_Link" />
+    <exclude body1="right_hip_pitch_Link" body2="right_hip_yaw_Link" />
+    <exclude body1="right_hip_pitch_Link" body2="torso_Link" />
   </contact>
+  <keyframe>
+    <key name="lying_supine" qpos="0.010255 -0.000128 0.089424 0.724214 0.000480 -0.689574 -0.000917 0.002164 -0.000077 0.277423 0.186659 0.009506 -0.011465 0.380905 -0.324751 0.334620 0.118678 0.186542 -0.007937 0.011036 0.385031 0.324552 0.326678 -0.114988 -0.009278 -0.003617 0.004884 -0.092678 0.055745 0.004042 -0.009558 0.006638 0.004827 -0.092382 0.034326 0.003193" />
+    <key name="lying_prone" qpos="0.010923 -0.000951 0.233076 0.821890 0.002037 0.569641 -0.001462 0.000468 -0.005564 0.421840 0.678413 -0.016582 -0.159844 -0.470032 0.002114 -0.276336 0.357933 0.675469 0.006429 0.176769 -0.466754 -0.011444 -0.281107 -0.382403 0.185180 -0.016625 0.083476 0.372209 -0.038781 0.018658 0.186538 0.006578 -0.075987 0.369599 -0.040654 -0.022168" />
+    <key name="lying_side_left" qpos="-0.011594 0.020791 0.265546 0.802887 0.594820 -0.024803 -0.030780 -0.006664 0.325608 0.049160 -0.015301 -0.062192 -0.042656 0.009704 0.002527 0.029838 -1.239584 -0.026453 0.046727 -0.063345 -0.104150 0.208419 0.087073 0.200584 0.062354 0.103011 0.011379 0.013839 0.014966 -0.291386 0.074417 0.268312 -0.027926 -0.020136 -0.000627 -0.037095" />
+    <key name="lying_side_right" qpos="-0.011733 -0.021372 0.266888 0.803060 -0.594692 -0.024233 0.029129 0.007928 -0.326154 0.044222 -0.029925 -0.046586 0.064514 -0.097648 -0.198772 0.063407 -0.180756 -0.015612 0.062295 0.041694 0.023625 -0.019254 0.020840 1.233483 0.069834 -0.267385 0.038233 -0.026779 0.012455 0.021105 0.048066 -0.102029 0.005692 0.016961 0.013926 0.293227" />
+  </keyframe>
 </mujoco>

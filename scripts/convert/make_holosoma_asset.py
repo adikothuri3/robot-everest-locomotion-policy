@@ -4,7 +4,8 @@ From the official a3_ultra_t2d5 model:
   MJCF: - weld head joints (head_yaw/head_pitch removed; bodies+mass kept)
         - remove their actuators/sensors
         - remove the official keyframe (qpos dim changes; it was a captured
-          off-nominal pose anyway)
+          off-nominal pose anyway); add settled lying keyframes
+          (supine/prone/sides) for the get-up task
         - rename free joint to `floating_base_joint` (G1/Holosoma convention)
         - add massless-ish `*_foot_contact_point` bodies at the sole center
         - rewrite mesh paths to local `meshes/`
@@ -33,19 +34,34 @@ FOOT_SOLE_POS = "0.04 0 -0.067"  # sole center in ankle_roll frame (= official f
 # official per-link MESH collisions overflow MJWarp's per-env constraint
 # allocation (nefc/njmax) and are slow; standard practice (cf. Holosoma's G1
 # asset) is primitive collisions. Feet keep the official 13 spheres per side.
-# These bodies cover termination/penalty contacts (pelvis/shoulder/hip) plus
-# common fall contacts (torso, thigh, shin, elbow).
+# v4 (get-up task): every body carrying an official collision mesh gets a box —
+# lying/rolling/push-off needs credible ground contact on head, upper arms,
+# forearms/hands, and the hip cluster, not just the locomotion contact set.
 PRIMITIVE_COLLISION_BODIES = [
     "pelvis_link",
     "torso_Link",
+    "head_yaw_Link",
+    "head_pitch_Link",
     "left_shoulder_roll_Link",
     "right_shoulder_roll_Link",
+    "left_shoulder_yaw_Link",
+    "right_shoulder_yaw_Link",
+    "left_elbow_Link",
+    "right_elbow_Link",
+    "left_wrist_roll_Link",
+    "right_wrist_roll_Link",
+    "left_wrist_pitch_Link",
+    "right_wrist_pitch_Link",
+    "left_wrist_yaw_Link",
+    "right_wrist_yaw_Link",
+    "left_hip_pitch_Link",
+    "right_hip_pitch_Link",
+    "left_hip_roll_Link",
+    "right_hip_roll_Link",
     "left_hip_yaw_Link",
     "right_hip_yaw_Link",
     "left_knee_Link",
     "right_knee_Link",
-    "left_elbow_Link",
-    "right_elbow_Link",
 ]
 
 
@@ -76,6 +92,15 @@ def _collision_boxes_from_source() -> dict[str, list[dict]]:
     import numpy as np
 
     m = mujoco.MjModel.from_xml_path(str(SRC_DIR / "mjcf" / "a3_ultra_t2d5.xml"))
+
+    # completeness: every official collision-mesh body must be in our list
+    official = set()
+    for g in range(m.ngeom):
+        if m.geom_contype[g] != 0 and m.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH:
+            official.add(mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[g]))
+    missing = official - set(PRIMITIVE_COLLISION_BODIES)
+    assert not missing, f"official collision-mesh bodies not covered: {sorted(missing)}"
+
     boxes: dict[str, list[dict]] = {}
     for body in PRIMITIVE_COLLISION_BODIES:
         bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, body)
@@ -210,6 +235,118 @@ def convert_mjcf() -> None:
     print(f"MJCF written: {OUT_DIR / 'a3_ultra_29dof.xml'} ({len(used_meshes)} meshes copied)")
 
 
+def _set_nominal_pose(m, d) -> None:
+    """Default crouch stand (matches configs/robots/a3_ultra.yaml default_pose)."""
+    import mujoco
+
+    d.qpos[2] = 1.07
+    d.qpos[3] = 1.0
+    crouch = {"hip_pitch": -0.2, "knee": 0.4, "ankle_pitch": -0.2}
+    for j in range(m.njnt):
+        name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, j) or ""
+        for key, val in crouch.items():
+            if key in name:
+                d.qpos[m.jnt_qposadr[j]] = val
+
+
+def add_auto_excludes() -> None:
+    """Exclude self-collision body pairs that interpenetrate at the nominal pose.
+
+    AABB boxes are fatter than the official meshes; chain-neighbor pairs beyond
+    parent-child (auto-filtered by MuJoCo) can overlap permanently, e.g. the
+    wrist_roll->wrist_pitch->wrist_yaw cluster. Any pair penetrating at the
+    nominal stand is spurious-by-construction: it would emit constraint noise in
+    every frame of training. Derived mechanically, like the boxes themselves.
+    """
+    import mujoco
+
+    path = OUT_DIR / "a3_ultra_29dof.xml"
+    for _pass in range(4):
+        m = mujoco.MjModel.from_xml_path(str(path))
+        d = mujoco.MjData(m)
+        _set_nominal_pose(m, d)
+        mujoco.mj_forward(m, d)
+        floor = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        pairs = set()
+        for c in range(d.ncon):
+            g1, g2 = d.contact[c].geom1, d.contact[c].geom2
+            if floor in (g1, g2) or d.contact[c].dist >= 0:
+                continue
+            b1 = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[g1])
+            b2 = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[g2])
+            if b1 != b2:
+                pairs.add(tuple(sorted((b1, b2))))
+        if not pairs:
+            print(f"auto-excludes: converged after {_pass} pass(es)")
+            return
+        tree = ET.parse(path)
+        root = tree.getroot()
+        contact = root.find("contact")
+        if contact is None:
+            contact = ET.SubElement(root, "contact")
+        existing = {
+            tuple(sorted((e.get("body1"), e.get("body2"))))
+            for e in contact.findall("exclude")
+        }
+        new = sorted(pairs - existing)
+        assert new, f"pose still penetrating but pairs already excluded: {sorted(pairs)}"
+        for b1, b2 in new:
+            ET.SubElement(contact, "exclude", body1=b1, body2=b2)
+        print(f"auto-excludes pass {_pass}: added {len(new)} pairs: {new}")
+        ET.indent(tree)
+        tree.write(path)
+    raise RuntimeError("auto-exclude did not converge in 4 passes")
+
+
+LYING_ORIENTATIONS = {  # wxyz base quats: rotate about y (pitch) / x (roll)
+    "lying_supine": (0.7071068, 0.0, -0.7071068, 0.0),
+    "lying_prone": (0.7071068, 0.0, 0.7071068, 0.0),
+    "lying_side_left": (0.7071068, 0.7071068, 0.0, 0.0),
+    "lying_side_right": (0.7071068, -0.7071068, 0.0, 0.0),
+}
+
+
+def add_lying_keyframes() -> None:
+    """Bake settled lying keyframes (supine/prone/sides) into the asset.
+
+    Get-up training and the fallen-pose generator need canonical lying states;
+    HoST's README recommends shipping them as keyframes. Each is produced by
+    dropping the zero-pose robot from 0.5 m in a canonical orientation and
+    simulating until passive rest, so the keyframes stay mechanically derived
+    from the model rather than hand-authored.
+    """
+    import mujoco
+    import numpy as np
+
+    path = OUT_DIR / "a3_ultra_29dof.xml"
+    m = mujoco.MjModel.from_xml_path(str(path))
+    keys: dict[str, np.ndarray] = {}
+    for name, quat in LYING_ORIENTATIONS.items():
+        d = mujoco.MjData(m)
+        d.qpos[2] = 0.5
+        d.qpos[3:7] = quat
+        for i in range(12000):
+            mujoco.mj_step(m, d)
+            if i > 2000 and np.linalg.norm(d.qvel) < 0.03:
+                break
+        assert np.all(np.isfinite(d.qpos)), f"{name}: settle diverged"
+        keys[name] = d.qpos.copy()
+        print(f"keyframe {name}: settled in {i * m.opt.timestep:.1f} s, "
+              f"base z={d.qpos[2]:.3f}, |qvel|={np.linalg.norm(d.qvel):.3f}")
+
+    tree = ET.parse(path)
+    root = tree.getroot()
+    for kf in list(root.findall("keyframe")):
+        root.remove(kf)
+    kf = ET.SubElement(root, "keyframe")
+    for name, qpos in keys.items():
+        ET.SubElement(kf, "key", name=name,
+                      qpos=" ".join(f"{v:.6f}" for v in qpos))
+    ET.indent(tree)
+    tree.write(path)
+    print(f"keyframes written: {list(keys)}")
+
+
 def convert_urdf() -> None:
     tree = ET.parse(SRC_DIR / "urdf" / "model.urdf")
     root = tree.getroot()
@@ -265,14 +402,7 @@ def verify() -> None:
 
     # no spurious self-contacts at the default crouch pose
     d = mujoco.MjData(m)
-    d.qpos[2] = 1.07
-    d.qpos[3] = 1.0
-    crouch = {"hip_pitch": -0.2, "knee": 0.4, "ankle_pitch": -0.2}
-    for j in range(m.njnt):
-        name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, j) or ""
-        for key, val in crouch.items():
-            if key in name:
-                d.qpos[m.jnt_qposadr[j]] = val
+    _set_nominal_pose(m, d)
     mujoco.mj_forward(m, d)
     floor = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "floor")
     self_contacts = [
@@ -288,5 +418,7 @@ def verify() -> None:
 
 if __name__ == "__main__":
     convert_mjcf()
+    add_auto_excludes()
+    add_lying_keyframes()
     convert_urdf()
     verify()
