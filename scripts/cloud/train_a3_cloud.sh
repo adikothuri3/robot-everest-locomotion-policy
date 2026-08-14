@@ -69,19 +69,11 @@ cd "$WORK/holosoma"
 
 if [[ "$SIMULATOR" == "isaacsim" ]]; then
   echo "== [3/6] IsaacSim environment (conda env hssim; Ubuntu 22.04+) =="
-  if ! command -v conda >/dev/null; then
-    echo "installing Miniforge..."
-    curl -fsSL -o /tmp/miniforge.sh \
-      "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
-    bash /tmp/miniforge.sh -b -p "$HOME/miniforge3"
-    # shellcheck disable=SC1091
-    source "$HOME/miniforge3/etc/profile.d/conda.sh"
-    conda init bash >/dev/null
-  else
-    CONDA_BASE=$(conda info --base)
-    # shellcheck disable=SC1091
-    source "$CONDA_BASE/etc/profile.d/conda.sh"
-  fi
+  # setup_isaacsim.sh installs its OWN miniconda under $HOME/.holosoma_deps
+  # (scripts/source_common.sh) and creates the `hssim` env there; it is
+  # idempotent via $HOME/.holosoma_deps/.env_setup_finished_hssim. Do not
+  # bootstrap a second conda — source_isaacsim_setup.sh activates from
+  # holosoma's own CONDA_ROOT regardless of what is on PATH.
   bash scripts/setup_isaacsim.sh
   # shellcheck disable=SC1091
   source scripts/source_isaacsim_setup.sh
