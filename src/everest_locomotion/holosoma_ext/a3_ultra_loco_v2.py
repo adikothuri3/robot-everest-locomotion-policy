@@ -136,10 +136,22 @@ VEL_EST_TARGET_TERM = "base_lin_vel"  # privileged critic term regressed against
 # Lipschitz-constrained policy (component F, S4 ablation only)
 LCP_LAMBDA = 0.002
 
-# CAM reference amplitude (component D). ASSUMED — no reference motion exists for
-# the A3, so the vertical-CAM target is derived from the gait clock and scaled by
-# commanded forward speed. Tune here, and log `cam_z` / `cam_xy` before trusting it.
-CAM_REF_AMPLITUDE = 0.05  # (m^2/s) per (m/s) of commanded forward speed
+# CAM scale (component D), in mass-normalised m^2/s per m/s of commanded speed.
+# The ONE number to retune for CAM: it sets both the vertical-CAM target amplitude
+# and the horizontal-CAM damping normaliser.
+#
+# **ASSUMED.** No reference motion exists for the A3. Order of magnitude from a
+# limb-momentum estimate: arms ~5 kg at ~0.18 m lateral offset swinging ~0.4 m/s
+# fore-aft give ~0.7 kg.m^2/s; legs give ~1.1 the other way (which is what
+# anti-phase arm swing is for); the residual is ~0.2-0.5 kg.m^2/s, and /60 kg is
+# ~0.005 m^2/s. 0.01 asks for roughly twice the natural residual, i.e. "swing the
+# arms a bit more than you otherwise would".
+#
+# **Verify before trusting rew_cam_tracking:** read `Env/cam_z` off the first S2
+# run once the policy is walking and set this to that order of magnitude. The
+# reward's dynamic range no longer depends on getting it right (the error is
+# normalised by this same scale), but the *behaviour* it asks for does.
+CAM_REF_AMPLITUDE = 0.01
 
 # v1's tracking baseline, for the nightly gate on S1+
 V1_TRACK_LIN, V1_TRACK_ANG = 0.95, 0.8
@@ -720,29 +732,47 @@ def _compute_cam(env) -> torch.Tensor:
     return torch.cross(r, v, dim=-1).mul(m.unsqueeze(-1)).sum(dim=1) / total
 
 
-def cam_tracking(env, sigma: float = 0.05, amplitude: float = CAM_REF_AMPLITUDE) -> torch.Tensor:
+def cam_tracking(
+    env,
+    sigma: float = 0.25,
+    amplitude: float = CAM_REF_AMPLITUDE,
+    still_scale: float = 0.02,
+) -> torch.Tensor:
     """Track a gait-clock-derived vertical CAM reference.
 
-    ``exp(-((k_ref - k_z) / (1 + |k_ref|))^2 / sigma)``. The reference oscillates
-    with the left-leg gait phase and scales with commanded forward speed, so the
-    optimum is an anti-phase arm swing against leg motion — and standing still
-    asks for zero vertical CAM.
+    ``exp(-((k_ref - k_z) / scale)^2 / sigma)`` where the reference oscillates with
+    the left-leg gait phase and grows with commanded forward speed, so the optimum
+    is an anti-phase arm swing against leg motion — and standing still asks for
+    zero vertical CAM.
 
-    ``sigma`` and `CAM_REF_AMPLITUDE` are **ASSUMED**: no reference motion exists
-    for the A3, so there is nothing to derive them from. Check the logged `cam_z`
-    on the first S2 run before trusting the gate — too small a sigma makes the
-    term identically zero (no gradient at all), too large makes it uninformative.
+    **The error is normalised by the reference amplitude, not by an absolute
+    constant.** `docs/final_rl_policy.md` §3D writes the denominator as
+    ``1 + |k_ref|``, which silently assumes |k| is O(1). It is not: mass-normalised
+    CAM for a 60 kg walker is O(0.005) m²/s by a limb-momentum estimate, so an
+    absolute denominator makes this whole term vary only between 0.95 and 1.00 — a
+    near-constant that shapes nothing while looking healthy in the logs. Dividing
+    by the reference scale instead makes ``err`` O(1) at "missed the target by a
+    full swing" for *any* amplitude, so ``sigma`` is dimensionless and the term
+    keeps its dynamic range even if `CAM_REF_AMPLITUDE` is off by 10x.
+
+    ``amplitude`` remains **ASSUMED** — it sets how much swing is asked for, which
+    is a behavioural choice with no reference motion to derive it from. Read
+    ``Env/cam_z`` off the first S2 run once the policy is walking and set
+    ``amplitude`` to that order of magnitude (see [[open-questions]]).
     """
     gait = env.command_manager.get_state("locomotion_gait")
     phase = gait.phase[:, 0]
     speed = torch.norm(env.command_manager.commands[:, :2], dim=1)
     ref = amplitude * speed * torch.sin(phase)
-    err = (ref - env.cam[:, 2]) / (1.0 + ref.abs())
+    # still_scale keeps the standing case (ref == 0) finite: it asks for CAM small
+    # compared to still_scale rather than dividing by zero.
+    scale = amplitude * speed + still_scale
+    err = (ref - env.cam[:, 2]) / scale
     return torch.exp(-err.square() / sigma)
 
 
 def penalty_cam_damping(
-    env, cam_ref: float = 0.5, max_value: float = 5.0
+    env, cam_ref: float = CAM_REF_AMPLITUDE, max_value: float = 5.0
 ) -> torch.Tensor:
     """Penalise *growth* of horizontal centroidal angular momentum.
 
@@ -1271,11 +1301,11 @@ def build_reward(
     if cam:
         terms["cam_tracking"] = RewardTermCfg(
             func=f"{_X}:cam_tracking", weight=1.0,
-            params={"sigma": 0.05, "amplitude": CAM_REF_AMPLITUDE},
+            params={"sigma": 0.25, "amplitude": CAM_REF_AMPLITUDE},
         )
         terms["penalty_cam_damping"] = RewardTermCfg(
             func=f"{_X}:penalty_cam_damping", weight=-0.5,
-            params={"cam_ref": 0.5, "max_value": 5.0},
+            params={"cam_ref": CAM_REF_AMPLITUDE, "max_value": 5.0},
             tags=["penalty_curriculum"],
         )
     if gait_quality:
@@ -1429,9 +1459,27 @@ terrain_locomotion_slopes = replace(
 )
 
 
+#: Replay slots per env. `SimpleReplayBuffer` allocates FOUR
+#: ``[num_envs, buffer_size, obs_dim]`` float32 tensors (obs, next_obs, critic_obs,
+#: next_critic_obs), so its footprint scales **linearly with the observation
+#: width** — and component G multiplies that width by 5.75x. At holosoma's default
+#: 1024 slots, 4096 envs and s1's 575/590 dims that is 36.9 GiB of replay before
+#: the simulator's ~7 GiB, which OOMs a 40 GB A100 during `setup()`:
+#:
+#:      buffer GiB = (2*actor_dim + 2*critic_dim + n_act + 4) * 4 * num_envs * slots
+#:
+#: 256 slots keeps every v2 stage under ~11 GiB (s1 9.2, s2 10.3, s3 11.1) and
+#: still holds 4096 * 256 = 1.05M transitions, a normal replay size. Override with
+#: `--algo.config.buffer-size N`; halve it again for a 24 GB card, or drop
+#: `critic_obs` history to 1 (the critic gets privileged `base_lin_vel`, so it does
+#: not need history for state estimation the way the actor does).
+V2_BUFFER_SIZE = 256
+
+
 def build_algo(
     *, iterations: int, vel_estimator: bool = False, scandots: bool = False,
     lcp: bool = False, symmetry: bool = True, compile_: bool = True,
+    buffer_size: int = V2_BUFFER_SIZE,
 ):
     if lcp:
         target = f"{_X}.A3UltraFastSACAgentLCP"
@@ -1447,6 +1495,7 @@ def build_algo(
         config=replace(
             algo.fast_sac.config,
             num_learning_iterations=iterations,
+            buffer_size=buffer_size,
             use_symmetry=symmetry,
             use_cnn_encoder=scandots,
             encoder_obs_key="perception_obs",
@@ -1478,6 +1527,7 @@ def build_experiment(
     lcp: bool = False,
     lin_vel_x=(-1.0, 1.0),
     compile_: bool = True,
+    buffer_size: int = V2_BUFFER_SIZE,
 ) -> ExperimentConfig:
     return ExperimentConfig(
         env_class=f"{_X}.A3UltraLocoV2Manager",
@@ -1488,6 +1538,7 @@ def build_experiment(
             scandots=scandots,
             lcp=lcp,
             compile_=compile_,
+            buffer_size=buffer_size,
         ),
         simulator=simulator.isaacsim,
         robot=a3_ultra_presets.a3_ultra_29dof,
@@ -1527,9 +1578,11 @@ def build_experiment(
 
 # S0 — every feature OFF. The ONLY job is to prove the refactor is neutral before
 # six behavioural changes land on top: 68/68 grid, lin-vel err <= 0.16. Not optional.
+# buffer_size stays at holosoma's 1024 here: S0's job is to be v1 in every respect
+# it can be, and at 100/103 dims that is only 6.9 GiB.
 a3_ultra_loco_v2_s0 = EXPERIMENT_REGISTRY.add(
     "a3_ultra_loco_v2_s0",
-    build_experiment("a3_ultra_loco_v2_s0", iterations=10_000),
+    build_experiment("a3_ultra_loco_v2_s0", iterations=10_000, buffer_size=1024),
 )
 
 # S1 — A heading + B estimator + G history(5), and the widened command envelope.
