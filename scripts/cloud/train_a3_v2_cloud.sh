@@ -7,9 +7,15 @@
 # A100 / H100 / L40S / A10 / RTX 6000 Ada).
 #
 #   git clone <this-repo-url> everest && cd everest
-#   bash scripts/cloud/train_a3_v2_cloud.sh s0        # 10k it, ~35 min
-#   bash scripts/cloud/train_a3_v2_cloud.sh s1        # 50k it, ~2.7 h
-#   bash scripts/cloud/train_a3_v2_cloud.sh all       # s0 -> s4, ~16-19 GPU-h
+#   bash scripts/cloud/train_a3_v2_cloud.sh s0            # 10k it, ~35 min
+#   bash scripts/cloud/train_a3_v2_cloud.sh s1            # 50k it, ~2.7 h
+#   bash scripts/cloud/train_a3_v2_cloud.sh all           # s0 -> s4, ~16-19 GPU-h
+#   bash scripts/cloud/train_a3_v2_cloud.sh rest          # s1 -> s4 (s0 already done)
+#   bash scripts/cloud/train_a3_v2_cloud.sh s1 s3 s4      # any queue you like
+#
+# Stages run back-to-back unattended. A stage that FAILS does not abort the queue
+# (a transient death at hour 6 would otherwise cost every remaining stage); the
+# run prints a QUEUE SUMMARY at the end saying which stages produced artifacts.
 #
 # Stages (each is graded against v1 and promoted only if it wins):
 #   s0       every feature OFF                      10k   ~35 min
@@ -39,7 +45,6 @@
 # =============================================================================
 set -euo pipefail
 
-STAGE_ARG="${1:-s1}"
 SIMULATOR="${SIMULATOR:-isaacsim}"
 NUM_ENVS="${NUM_ENVS:-4096}"
 SEED="${SEED:-1}"
@@ -49,11 +54,20 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="${WORK:-$HOME}"
 EXT="$REPO_DIR/src/everest_locomotion/holosoma_ext/a3_ultra_loco_v2.py"
 
-case "$STAGE_ARG" in
-  all) STAGES=(s0 s1 s2 s3 s4) ;;
-  s0|s1|s2|s3|s4|s4-lcp) STAGES=("$STAGE_ARG") ;;
-  *) echo "unknown stage: $STAGE_ARG (use s0|s1|s2|s3|s4|s4-lcp|all)"; exit 1 ;;
-esac
+# Accepts any number of stages, run back-to-back unattended:
+#   ... s1                 one stage
+#   ... s1 s2 s3 s4        a queue (skip s0 if it already ran)
+#   ... all                s0 s1 s2 s3 s4
+#   ... rest               s1 s2 s3 s4
+STAGES=()
+for arg in "${@:-s1}"; do
+  case "$arg" in
+    all)  STAGES+=(s0 s1 s2 s3 s4) ;;
+    rest) STAGES+=(s1 s2 s3 s4) ;;
+    s0|s1|s2|s3|s4|s4-lcp) STAGES+=("$arg") ;;
+    *) echo "unknown stage: $arg (use s0|s1|s2|s3|s4|s4-lcp|all|rest)"; exit 1 ;;
+  esac
+done
 
 echo "== [1/6] Sanity =="
 command -v nvidia-smi >/dev/null || { echo "ERROR: no NVIDIA driver"; exit 1; }
@@ -96,17 +110,25 @@ if [[ -n "${WANDB_API_KEY:-}" ]]; then
 fi
 
 COMMIT_SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+echo
+echo "== queue: ${STAGES[*]} =="
 
+SUMMARY=()
 for STAGE in "${STAGES[@]}"; do
   EXP="a3-ultra-loco-v2-${STAGE}"
   echo
   echo "== [5/6] Train $EXP  sim=$SIMULATOR envs=$NUM_ENVS seed=$SEED code=$COMMIT_SHA =="
+  date -u "+     started %Y-%m-%d %H:%M:%SZ"
 
   ITER_ARGS=()
   if [[ -n "${ITERATIONS:-}" ]]; then
     ITER_ARGS=(--algo.config.num-learning-iterations "$ITERATIONS")
   fi
 
+  # A stage that dies must not take the rest of an overnight queue with it: a
+  # transient failure at hour 6 would otherwise cost every remaining stage. Record
+  # it, keep going, and report at the end.
+  set +e
   # shellcheck disable=SC2086
   python src/holosoma/holosoma/train_agent.py "exp:$EXP" "simulator:$SIMULATOR" \
     "${LOGGER_ARGS[@]}" \
@@ -115,20 +137,39 @@ for STAGE in "${STAGES[@]}"; do
     --training.seed "$SEED" \
     "${ITER_ARGS[@]}" \
     ${EXTRA_ARGS:-}
+  RC=$?
+  set -e
+
+  if [[ $RC -ne 0 ]]; then
+    echo "!! $EXP FAILED (exit $RC) — continuing with the rest of the queue"
+    SUMMARY+=("$STAGE  FAILED (exit $RC)")
+    continue
+  fi
 
   echo "== [6/6] Collect artifacts for $EXP =="
-  RUN_DIR=$(ls -dt "$WORK"/holosoma/logs/everest-a3/*"${EXP//-/_}"*/ | head -1)
+  RUN_DIR=$(ls -dt "$WORK"/holosoma/logs/everest-a3/*"${EXP//-/_}"-locomotion/ 2>/dev/null | head -1)
+  if [[ -z "$RUN_DIR" ]]; then
+    echo "!! no log dir found for $EXP"
+    SUMMARY+=("$STAGE  trained but NO ARTIFACTS")
+    continue
+  fi
   OUT="$REPO_DIR/checkpoints/cloud_$(basename "$RUN_DIR")"
   mkdir -p "$OUT"
   cp "$RUN_DIR"/model_*.pt "$RUN_DIR"/model_*.onnx "$RUN_DIR"/holosoma_config.yaml "$OUT"/ 2>/dev/null || true
   cp "$RUN_DIR"/events.out.tfevents.* "$OUT"/ 2>/dev/null || true
   echo "$COMMIT_SHA" > "$OUT/CODE_COMMIT"
   echo "artifacts in: $OUT"
+  SUMMARY+=("$STAGE  ok -> checkpoints/$(basename "$OUT")")
 done
+
+echo
+echo "=============================== QUEUE SUMMARY ==============================="
+for line in "${SUMMARY[@]}"; do echo "  $line"; done
+echo "============================================================================="
 
 cat <<EOF
 
-Done. Retrieve locally:
+Retrieve locally:
   scp -r ubuntu@<instance>:$REPO_DIR/checkpoints/cloud_* ./checkpoints/
 
 Then grade (docs/final_rl_policy.md §7) — the harness reads each policy's
