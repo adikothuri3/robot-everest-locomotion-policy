@@ -166,6 +166,60 @@ class ObsLayout:
             arm_dof_indices=list(range(n_dof - 14, n_dof)),
         )
 
+    # Per-frame width of every term this harness knows how to reproduce. Terms
+    # sized by the robot rather than fixed use ``None``.
+    TERM_DIMS = {
+        "actions": None,
+        "dof_pos": None,
+        "dof_vel": None,
+        "base_ang_vel": 3,
+        "projected_gravity": 3,
+        "command_lin_vel": 2,
+        "command_ang_vel": 1,
+        "sin_phase": 2,
+        "cos_phase": 2,
+        "heading_error": 1,
+        "action_authority": 1,
+    }
+
+    @classmethod
+    def from_experiment_config(cls, cfg: dict, n_dof: int) -> ObsLayout:
+        """Derive the layout from the training config every export embeds.
+
+        A v1 policy predates the `actor_obs_layout` blob but still carries its
+        whole `experiment_config`, including `observation.groups.actor_obs`. That
+        is a better source than a table in this repo for the same reason the blob
+        is: it was written by the run that produced the weights. Terms are placed
+        in **alphabetically sorted** order because that is what
+        `ObservationManager.compute_group` does — verified here by the fact that
+        this reproduces `v1_default` column-for-column on the 68/68 locomotion
+        policy (`tests/test_obs_layout.py`).
+        """
+        group = cfg["observation"]["groups"]["actor_obs"]
+        hist = int(group.get("history_length", 1))
+        terms, cursor = [], 0
+        for name in sorted(group["terms"]):
+            if name not in cls.TERM_DIMS:
+                raise KeyError(
+                    f"observation term '{name}' is in the policy's training config "
+                    "but this harness cannot reproduce it — add it to "
+                    "ObsLayout.TERM_DIMS and A3Sim._term_frame before grading."
+                )
+            dim = cls.TERM_DIMS[name] or n_dof
+            scale = group["terms"][name].get("scale", 1.0)
+            if isinstance(scale, (list, tuple)):
+                scale = float(scale[0])
+            terms.append(
+                ObsTerm(name, "actor_obs", dim, hist, float(scale), cursor, dim * hist)
+            )
+            cursor += dim * hist
+        return cls(
+            terms=terms,
+            total_dim=cursor,
+            arm_dof_indices=list(range(n_dof - 14, n_dof)),
+            source="experiment_config",
+        )
+
     @classmethod
     def from_metadata(cls, payload: dict, n_dof: int) -> ObsLayout:
         """Parse the ``actor_obs_layout`` blob a v2 policy carries."""
@@ -249,6 +303,11 @@ class HolosomaPolicy:
             self.layout = ObsLayout.from_metadata(
                 json.loads(meta["actor_obs_layout"]), self.n_dof
             )
+        elif "actor_obs" in cfg.get("observation", {}).get("groups", {}):
+            # v1 export: no layout blob, but the training config is embedded and
+            # says exactly which terms the actor saw. Needed for any v1 task that
+            # is not locomotion -- the get-up policy has 93 dims, not 100.
+            self.layout = ObsLayout.from_experiment_config(cfg, self.n_dof)
         else:
             self.layout = ObsLayout.v1_default(self.n_dof)
 
