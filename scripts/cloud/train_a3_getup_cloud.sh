@@ -18,10 +18,11 @@
 # posture. HumanUP = prone->supine ROLLOVER policy (98.3% on hardware) +
 # supine GET-UP policy (78.3%); HoST = per-posture policies, sides handled by
 # the supine one. Run #1 (single policy, all postures) plateaued at 30% ~= the
-# supine share of our pose bank. So: a3-ultra-rollover trains on prone starts
-# (success = settled on the back, 1 s), a3-ultra-getup trains on supine+side
-# starts (success = locomotion handoff pose, 2 s). At runtime a projected-
-# gravity router chains rollover -> getup -> locomotion.
+# supine share of our pose bank. So: a3-ultra-rollover trains on prone AND
+# side starts (success = settled on the back, 1 s; HoST's side coverage came
+# from its prone policy), a3-ultra-getup trains on supine starts + sit/kneel/
+# crouch waypoints + standing anchors (success = locomotion handoff pose, 2 s).
+# At runtime a projected-gravity router chains rollover -> getup -> locomotion.
 #
 # What this trains (see docs/research/getup_recipes.md and the getup extension
 # src/everest_locomotion/holosoma_ext/a3_ultra_getup.py):
@@ -41,13 +42,18 @@
 # tags are logged WITHOUT a prefix):
 #   getup_success_rate     -> target >0.95 for rollover (settled-on-back gate),
 #                             >0.9 for getup (manifest handoff-pose gate)
-#   getup_assist_scale     -> must anneal 1.0 -> 0.0 (success without assist
-#                             is the only success that counts)
-#   penalty_scale          -> smoothness ramp (0.1 -> 1.0)
-#   average_episode_length -> must start near ~500 (=10 s), NOT ~10 (if it
-#                             pins low, envs are dying at spawn — abort)
-# A policy is only DONE when: success_rate > 0.9 AND assist_scale == 0.0
-# AND penalty_scale == 1.0.
+#   getup_assist_scale, getup_rose_rate -> GETUP RUN ONLY (rollover has no
+#                             assist force: its assist_scale logs 1.0 and
+#                             rose_rate ~0 forever — that is normal)
+#   getup_action_authority -> getup run: must anneal 2.0 -> 1.0
+#   penalty_scale          -> smoothness ramp (0.1 -> 1.0), both runs
+#   average_episode_length -> rollover ~250 max (5 s), getup ~500 max (10 s);
+#                             getup runs BELOW max early by design (stuck-low
+#                             recycling) and approaches it as rising works.
+#                             Pinned at ~10-30 = dying at spawn: abort.
+# DONE, rollover: success_rate > 0.95 AND penalty_scale == 1.0.
+# DONE, getup:    success_rate > 0.9 AND assist_scale == 0.0 AND
+#                 authority == 1.0 AND penalty_scale == 1.0.
 # =============================================================================
 set -euo pipefail
 

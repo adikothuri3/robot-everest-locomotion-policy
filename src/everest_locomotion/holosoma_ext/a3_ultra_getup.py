@@ -97,7 +97,9 @@ SUCCESS_POSE_TOL = 0.30
 SUCCESS_LIN_VEL = 0.25
 SUCCESS_JOINT_VEL = 1.0
 MAX_ASSIST_FORCE_N = 350.0     # ~60% of 590 N weight (HoST heuristic)
-WRIST_ACTION_FACTOR = 0.2      # 0.25 * 0.2 = manifest wrist_action_scale 0.05
+WRIST_ACTION_FACTOR = 0.2      # at deploy authority 1.0: 0.25*0.2 = manifest 0.05
+                               # (early training: authority 2.0 -> wrists at 0.1,
+                               # annealing to the manifest cap with everything else)
 POSES_DIR_DEFAULT = os.path.normpath(os.path.join(a3_ultra_presets.ASSET_ROOT, "..", "getup"))
 POSES_DIR = os.environ.get("EVEREST_A3_GETUP_POSES", POSES_DIR_DEFAULT)
 # Fail at import (seconds) rather than after the multi-minute IsaacSim scene
@@ -392,9 +394,9 @@ class A3UltraRolloverManager(A3UltraGetupManager):
 
     The literature never asked one policy to rise from every posture: HumanUP
     pairs a prone->supine rollover policy (98.3% hardware success) with a
-    supine get-up policy (78.3%), and HoST ships per-posture configs with
-    side-lying handled by the SUPINE policy. This class is the rollover half;
-    a3-ultra-getup trains on supine+sides. No assist force (rolling does not
+    supine get-up policy (78.3%), and HoST's side-lying coverage came from its
+    PRONE policy zero-shot. This class is the rollover half and owns prone AND
+    side starts; a3-ultra-getup trains supine-only. No assist force (rolling does not
     fight gravity the way rising does) and no standing easy-starts.
     Success = lying flat on the back, settled, held 1 s.
     """
