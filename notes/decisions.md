@@ -1,6 +1,6 @@
 ---
 title: Decisions
-updated: 2026-08-14
+updated: 2026-08-15
 status: current
 ---
 
@@ -10,7 +10,7 @@ Newest first. Each entry: what was chosen, why, what was rejected. Add an entry 
 
 ## 2026-08-15 — Get-up v3: assist gate corrected, KSI waypoints, authority curriculum (research round 3)
 
-**Chosen:** (1) assist force re-gated to HoST's validated semantics — fires while trunk NEAR-VERTICAL (aids the torque-critical rise), never drags a flat-lying robot; annealed by a loose terminal-height "rose rate" (HoST's trigger) so the strict handoff contract is learned force-free. (2) KSI: 450 sit/kneel/crouch waypoint poses at 25% of getup resets (UniReLo's biggest ablation; HiFAR/H1-2 precedent). (3) Strong-to-weak action-authority curriculum 2.0→1.0 with β in obs (HoST/Tao'22/HumanUP-supported). (4) Actor history 5. (5) H1-2-style height-gated arm-support reward + stuck-low termination. **Strategy verdict:** hip-sit-up→tuck→deep-squat route transfers to the A3 (HoST's G1 has NO waist pitch — waist worry void; A3 specific leg torque beats G1 and the hardware-proven ~70 kg H1-2). **Rejected with evidence:** multi-critic (ablation confounded with advantage normalization; HumanUP 95% single-critic; escalate only if plateau <60-70%), Stage-II slowed tracking (smoothness fallback only), SAC main line, kip-up route (heavy-robot momentum rise failed sim-to-real in its one precedent). Full citations: `docs/research/getup_recipes.md` update (2).
+**Chosen:** (1) assist force re-gated to HoST's validated semantics — fires while trunk NEAR-VERTICAL (aids the torque-critical rise), never drags a flat-lying robot; annealed by a loose terminal-height "rose rate" (HoST's trigger) so the strict handoff contract is learned force-free. (2) KSI: 450 sit/kneel/crouch waypoint poses at 25% of getup resets (UniReLo's biggest ablation; HiFAR/H1-2 precedent). (3) Strong-to-weak action-authority curriculum 2.0→1.0 with β in obs (HoST/Tao'22/HumanUP-supported). (4) Actor history 5. (5) H1-2-style height-gated arm-support reward + stuck-low termination — the latter gated on height **and** projected gravity (`pg_z > -0.5`), because a robot that has SAT UP sits at pelvis 0.15–0.29 m and a height-only gate would recycle successful sitters mid-exploration, killing the sit→crouch transition KSI exists to densify. **Strategy verdict:** hip-sit-up→tuck→deep-squat route transfers to the A3 (HoST's G1 has NO waist pitch — waist worry void; A3 specific leg torque beats G1 and the hardware-proven ~70 kg H1-2). **Rejected with evidence:** multi-critic (ablation confounded with advantage normalization; HumanUP 95% single-critic; escalate only if plateau <60-70%), Stage-II slowed tracking (smoothness fallback only), SAC main line, kip-up route (heavy-robot momentum rise failed sim-to-real in its one precedent). Full citations: `docs/research/getup_recipes.md` update (2).
 
 ## 2026-08-15 — Get-up is TWO policies (rollover + supine get-up), not one
 

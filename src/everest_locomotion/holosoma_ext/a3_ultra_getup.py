@@ -793,11 +793,17 @@ def task_arm_support(env, height_gate: float = 0.60) -> torch.Tensor:
 
 
 def getup_stuck_low(env, min_height: float = 0.30, after_s: float = 6.0) -> torch.Tensor:
-    """Recycle hopeless episodes (H1-2's failure signature is 100% stuck-low):
-    still below lying-ish height late in the episode -> reset. Getup task only
-    (a rollover env is SUPPOSED to stay low)."""
+    """Recycle hopeless episodes (H1-2's failure signature is 100% stuck-low).
+
+    "Stuck" = still LYING late in the episode: low pelvis AND still horizontal.
+    The orientation condition is load-bearing — a robot that has SAT UP has
+    pelvis height 0.15-0.29 m (below the height threshold!) but pg_z ~ -0.9;
+    height alone would recycle successful sitters mid-exploration, exactly the
+    sit->crouch transition KSI exists to densify. Getup task only (a rollover
+    env is SUPPOSED to stay low)."""
     late = env.episode_length_buf > int(after_s / env.dt)
-    return late & (getup_base_height(env) < min_height)
+    lying = get_projected_gravity(env)[:, 2] > -0.5
+    return late & lying & (getup_base_height(env) < min_height)
 
 
 # ---------------------------------------------------------------------------
