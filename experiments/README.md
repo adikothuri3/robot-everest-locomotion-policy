@@ -26,6 +26,22 @@ config dump (holosoma writes `holosoma_config.yaml` per run), TensorBoard events
 | E09 | strong terrain + strong DR | E05 + widened DR ranges | needs E05 |
 | E10 | first alpine curriculum | Tomasz terrain via `TerrainPatch` → custom holosoma terrain term or mesh export | blocked on terrain generator handoff |
 
+### Final walking policy (E09a–E09e) — spec: `docs/final_rl_policy.md`
+
+Staged rebuild of the locomotion policy on the same stack, fixing the three defects the gate
+measured (≈15% speed undershoot, 3–6°/s yaw drift, blindness to arm motion). ~16 GPU-h total at
+0.195 s/iteration with 4096 envs. Each stage is graded on the 68-scenario grid plus the arm
+suite and promoted only on its gate; **S0 is not optional** — it is what proves the refactor is
+neutral before six behavioural changes land on top.
+
+| ID | Purpose | Command core | Status |
+| --- | --- | --- | --- |
+| E09a | S0 — new `a3-ultra-fast-sac-v2` extension, all new features OFF (refactor is neutral) | `exp:a3-ultra-fast-sac-v2 $IMPORT2 --algo.config.num_learning_iterations 10000` | ready — spec written, code not started |
+| E09b | S1 — heading command + concurrent velocity estimator + obs history 5–10 | as E09a, features A/B/G enabled | needs E09a; **B needs a holosoma fork** |
+| E09c | S2 — upper-body pose curriculum + centroidal angular momentum reward | as E09b + C/D | needs E09b |
+| E09d | S3 — 13×9 height scan (`perception_obs`, `use_cnn_encoder=True`) + slope terrain tiles | as E09c + E | needs E09c **and** scandot support in the MuJoCo gate |
+| E09e | S4 — smoothness ablation: jerk/curvature rewards vs Lipschitz penalty (λ 0.002) | two 30k runs from the E09d checkpoint | needs E09d |
+
 ## Get-up ladder (mission: smooth self-recovery; plan in `docs/research/getup_recipes.md`)
 
 Asset v5 (full-body collision boxes + lying keyframes) and the fallen-pose bank

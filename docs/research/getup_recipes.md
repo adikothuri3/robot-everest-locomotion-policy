@@ -140,3 +140,54 @@ simplified collisions, HiFAR's sagittal-plane stage + keyframe resets. Our
 assist curriculum plays that role for get-up; the rollover task is dense enough
 (cosine gradient + roll-rate) not to need one. FRASA's CrossQ (max-entropy
 off-policy) is the fallback precedent if discovery still stalls.
+
+## Update 2026-08-15 (2) — deep-dive v3: strategy verdict + technique upgrades
+
+**Strategy verdict for the A3's morphology (research round 3):** the proven G1
+route — hip-flexion sit-up with arm strut → deep leg tuck → deep-squat rise —
+transfers. Decisive facts: HoST's G1 URDF has NO waist pitch at all (righting
+is a pure hip sit-up; our +2.93 rad hip beats their +2.88); specific leg
+torque τ/(m·h): A3 knee 3.1 / hip 2.1 vs G1 3.0/1.9 (proven) and H1-2 2.9/1.75
+(proven at ~70 kg, sim 93.4%, hardware 10/10 — arXiv:2603.08619). Our single
+kinematic deficit is knee range (145° vs G1's 165° tuck), paid at the hip
+where we're strongest. Kip-up (AgiBot demoed one on the A3 sibling) is a
+stunt, not a recovery: the one heavy-robot momentum-rise precedent (K1,
+IROS 2003) failed sim-to-real. Adult-size get-up census: only Atlas (RL
+mocap-tracking), Digit, AgiBot A3, and the H1-2 paper exist; nobody else has
+shown it.
+
+**Technique upgrades adopted (evidence round 3):**
+1. **Assist gate corrected to HoST semantics** — force fires while trunk is
+   NEAR-VERTICAL (assists the torque-critical rise), never while lying flat;
+   no height cutoff. The 0%-without-force ablation validated THIS shape; our
+   old gate (push while pelvis < 0.8 m) was inverted relative to it.
+2. **Anneal driver = loose "rose" proxy** (terminal pelvis > 0.75 m EMA),
+   HoST's terminal-head-height trigger — assist hits zero early, the strict
+   handoff contract is learned force-free. Strict success remains the
+   reported metric.
+3. **KSI waypoint inits**: 450 sit/kneel/crouch mid-route poses
+   (`scripts/getup/generate_waypoint_poses.py`, PD-hold + floor-only
+   penetration-scan spawn, short settle — keyframes are mid-motion states,
+   not equilibria) at a static 25% share. Evidence: UniReLo init ablation
+   (largest, ≤24 pts), HiFAR keyframes, H1-2 init categories.
+4. **Action-authority curriculum** β 2.0→1.0 (effective scale 0.5→0.25),
+   annealed with the assist, β in the actor obs (HoST puts β in s_t;
+   strong-to-weak triple-supported: HoST, Tao'22, HumanUP).
+5. **Actor history 1→5** (HoST Table III(c)).
+6. **Height-gated arm-support reward** (H1-2): elbow/forearm struts encouraged
+   while pelvis low, fading with height — never penalized (24 Nm elbows).
+7. **Stuck-low termination** (getup only): below 0.3 m after 6 s → recycle
+   (H1-2's failure signature).
+
+**Explicitly NOT adopted (with reasons):** multi-critic (ablation baseline was
+an unbalanced sum; HumanUP hit 95.34% sim single-critic; our reward-magnitude
+audit passes — escalate only if v3 plateaus <60-70%); HumanUP Stage-II slowed
+tracking (their Stage I is deliberately unregularized — HoST one-stage reaches
+99.5% without it; keep as smoothness fallback); CrossQ/SAC main line (no
+full-DoF evidence at scale; FastSAC variants kept as ablations); rate/episode
+changes (already at the universal 10 s / 50 Hz standard). **Reserve option**
+if the assist wrench misbehaves on IsaacSim: H1-2's torque-limit annealing
+(10×→1×) needs no force API at all. Also mined: NVIDIA WBC-AGILE
+(github.com/nvidia-isaac/WBC-AGILE) — the only released Isaac Lab stand-up
+code; its online reward normalization and value-bootstrapped termination are
+the next things to copy if reward-scale problems appear.

@@ -127,7 +127,9 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
         # resume — curriculum state must survive it, so only initialize once
         if not hasattr(self, "getup_assist_scale"):
             self.getup_assist_scale = 1.0  # annealed by GetupAssistCurriculum
+            self.getup_action_authority = 2.0  # strong-to-weak, anneals to 1.0
             self._success_rate = torch.tensor(0.0, device=self.device)
+            self._rose_rate = torch.tensor(0.0, device=self.device)
         self._assist_was_zero = False
         self._stand_hold_count = torch.zeros(n, dtype=torch.long, device=self.device)
         self._ever_success = torch.zeros(n, dtype=torch.bool, device=self.device)
@@ -169,6 +171,11 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
         self._torso_body_idx = self.simulator.find_rigid_body_indice(
             self.robot_config.torso_name
         )
+        self._arm_contact_idx = torch.tensor(
+            [i for i, n in enumerate(self.body_names)
+             if ("elbow" in n) or ("wrist" in n)],
+            dtype=torch.long, device=self.device,
+        )
 
     # -- per-step task state (runs before termination/reward on all backends) --
     def _pre_compute_observations_callback(self):
@@ -193,7 +200,9 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
         )
         self._ever_success |= self._stand_hold_count >= self.TASK_HOLD_STEPS
         self.log_dict["getup_success_rate"] = self._success_rate.detach().cpu()
+        self.log_dict["getup_rose_rate"] = self._rose_rate.detach().cpu()
         self.log_dict["getup_assist_scale"] = torch.tensor(float(self.getup_assist_scale))
+        self.log_dict["getup_action_authority"] = torch.tensor(float(self.getup_action_authority))
 
     TASK_HOLD_STEPS = HOLD_STEPS
 
@@ -219,6 +228,11 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
             batch = self._ever_success[env_ids].float().mean()
             weight = min(float(len(env_ids)) / max(1.0, 0.25 * self.num_envs), 1.0) * 0.2
             self._success_rate = self._success_rate * (1 - weight) + batch * weight
+            # HoST anneals on a LOOSE terminal-height proxy (head height at
+            # episode end > threshold), not on strict success — so the assist
+            # reaches zero early and the strict contract is learned force-free
+            rose = (getup_base_height(self)[env_ids] > 0.75).float().mean()
+            self._rose_rate = self._rose_rate * (1 - weight) + rose * weight
             self._ever_success[env_ids] = False
             self._stand_hold_count[env_ids] = 0
             self._getup_prev_dof_vel[env_ids] = 0.0
@@ -227,6 +241,10 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
     @property
     def getup_success_rate(self) -> float:
         return float(self._success_rate.detach().cpu().item())
+
+    @property
+    def getup_rose_rate(self) -> float:
+        return float(self._rose_rate.detach().cpu().item())
 
     @property
     def getup_easy_start_prob(self) -> float:
@@ -240,8 +258,13 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
 
     # -- wrist soft-freeze (manifest getup.wrist_action_scale) ---------------
     def _pre_physics_step(self, actions):
+        actions = actions.clone()
+        # strong-to-weak authority curriculum (HoST beta 1.0->0.25 analog;
+        # Tao 2022: fixed low limits trap the policy in local minima). Base
+        # action_scale is 0.25, so authority 2.0 -> effective 0.5 early,
+        # annealing to 1.0 -> the deployable 0.25.
+        actions *= float(self.getup_action_authority)
         if self._wrist_dof_idx.numel() > 0:
-            actions = actions.clone()
             actions[:, self._wrist_dof_idx] *= WRIST_ACTION_FACTOR
         super()._pre_physics_step(actions)
 
@@ -261,9 +284,13 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
             return
         self._assist_was_zero = False
 
-        heights = getup_base_height(self)
-        # help only while below the stand gate — assist must never hold the stand
-        mask = (heights < STAND_GATE_HEIGHT).float()
+        # HoST-validated gating (their 0%-without-force ablation used THIS
+        # shape): assist fires only once the trunk is NEAR-VERTICAL — it helps
+        # the torque-critical sit->squat->rise phase, never drags a flat-lying
+        # robot upward (righting is torque-cheap and must be learned honestly).
+        # No height cutoff: the anneal removes the force, not a gate.
+        pg_z = get_projected_gravity(self)[:, 2]
+        mask = (pg_z < UPRIGHT_GATE).float()
         fz = mask * (scale * MAX_ASSIST_FORCE_N)  # [N]
 
         simtype = get_simulator_type()
@@ -337,7 +364,9 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
     def get_checkpoint_state(self):
         state = super().get_checkpoint_state()
         state["getup_assist_scale"] = float(self.getup_assist_scale)
+        state["getup_action_authority"] = float(self.getup_action_authority)
         state["getup_success_rate"] = self._success_rate.detach().cpu()
+        state["getup_rose_rate"] = self._rose_rate.detach().cpu()
         return state
 
     def load_checkpoint_state(self, state):
@@ -346,9 +375,15 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
             return
         if "getup_assist_scale" in state:
             self.getup_assist_scale = float(state["getup_assist_scale"])
+        if "getup_action_authority" in state:
+            self.getup_action_authority = float(state["getup_action_authority"])
         if "getup_success_rate" in state:
             self._success_rate = torch.as_tensor(
                 float(state["getup_success_rate"]), device=self.device
+            )
+        if "getup_rose_rate" in state:
+            self._rose_rate = torch.as_tensor(
+                float(state["getup_rose_rate"]), device=self.device
             )
 
 
@@ -385,6 +420,10 @@ class A3UltraRolloverManager(A3UltraGetupManager):
     @property
     def getup_easy_start_prob(self) -> float:
         return 0.0
+
+    def _init_buffers(self):
+        super()._init_buffers()
+        self.getup_action_authority = 1.0  # fixed: no annealer in this task
 
     def _apply_assist_force(self):
         return
@@ -482,6 +521,27 @@ class PoseBankCommand(CommandTermBase):
         self.bank_dof_pos = dof_pos.contiguous()
         self.joint_noise = float(params.get("joint_noise_rad", 0.05))
         self.num_poses = len(bank)
+        # KSI waypoint bank (sit/kneel/crouch mid-route states): densifies the
+        # hard sit->crouch->rise region. UniReLo's init-distribution ablation
+        # is its largest (up to 24 pts); HiFAR/H1-2 both init from these
+        # categories. Share is static-uniform per the literature (no schedule).
+        self.waypoint_share = float(params.get("waypoint_share", 0.0))
+        self.waypoint_dof_pos = None
+        wp_file = poses_dir / "fallen_poses_waypoint.npy"
+        if self.waypoint_share > 0 and wp_file.exists():
+            wp = np.load(wp_file)
+            if len(wp):
+                wq = torch.tensor(wp[:, 3:7], dtype=torch.float, device=env.device)
+                self.waypoint_root_z = torch.tensor(wp[:, 2], dtype=torch.float, device=env.device)
+                self.waypoint_quat = wq[:, [1, 2, 3, 0]].contiguous()
+                self.waypoint_dof_pos = torch.tensor(
+                    wp[:, 7:], dtype=torch.float, device=env.device
+                )[:, perm].contiguous()
+        if self.waypoint_share > 0 and self.waypoint_dof_pos is None:
+            raise RuntimeError(
+                f"waypoint_share={self.waypoint_share} but {wp_file} missing/empty — "
+                "run scripts/getup/generate_waypoint_poses.py"
+            )
         logger.info(f"pose bank: {self.num_poses} poses, categories {self.categories}, from {poses_dir}")
 
     def reset(self, env_ids) -> None:
@@ -506,6 +566,17 @@ class PoseBankCommand(CommandTermBase):
         dof_pos = torch.clamp(dof_pos + noise, limits[:, 0], limits[:, 1])
         root_z = self.bank_root_z[rows]
         quat = self.bank_quat[rows]
+
+        # KSI waypoint starts (sit/kneel/crouch), sampled before easy-starts
+        if self.waypoint_dof_pos is not None:
+            way = (~easy) & (torch.rand(n, device=env.device) < self.waypoint_share)
+            wrows = torch.randint(0, len(self.waypoint_dof_pos), (n,), device=env.device)
+            wdof = self.waypoint_dof_pos[wrows]
+            wnoise = (torch.rand_like(wdof) * 2 - 1) * self.joint_noise
+            wdof = torch.clamp(wdof + wnoise, limits[:, 0], limits[:, 1])
+            dof_pos = torch.where(way.unsqueeze(1), wdof, dof_pos)
+            quat = torch.where(way.unsqueeze(1), self.waypoint_quat[wrows], quat)
+            root_z = torch.where(way, self.waypoint_root_z[wrows], root_z)
 
         # easy starts: locomotion default stand
         stand_quat = torch.zeros(n, 4, device=env.device)
@@ -560,10 +631,18 @@ class GetupAssistCurriculum(CurriculumTermBase):
         if self._resets_seen < self.interval_resets:
             return
         self._resets_seen = 0
-        rate = self.env.getup_success_rate
+        # anneal on the LOOSE rose proxy (HoST's terminal-height trigger), so
+        # the assist reaches zero early and the strict handoff contract is
+        # learned force-free; strict success stays the reported metric
+        rate = self.env.getup_rose_rate
         scale = float(self.env.getup_assist_scale)
         if rate > self.up_threshold:
             scale -= self.step_size
+            # strong-to-weak action authority anneals on the same trigger
+            # (HoST beta analog), one-way, floor 1.0 (= deploy scale 0.25)
+            self.env.getup_action_authority = max(
+                1.0, float(self.env.getup_action_authority) - 0.1
+            )
         elif rate < self.down_threshold:
             scale += self.step_size
         self.env.getup_assist_scale = min(self.max_scale, max(self.min_scale, scale))
@@ -689,6 +768,38 @@ def obs_base_height(env) -> torch.Tensor:
     return getup_base_height(env).unsqueeze(1)
 
 
+def obs_action_authority(env) -> torch.Tensor:
+    """Current authority beta — HoST includes beta in s_t so the policy can
+    condition on its own action scale as it anneals."""
+    return torch.full((env.num_envs, 1), float(env.getup_action_authority), device=env.device)
+
+
+def obs_feet_contact(env) -> torch.Tensor:
+    """Critic-only: binary foot load flags (privileged, cheap CP proxy)."""
+    return (env.simulator.contact_forces[:, env.feet_indices, 2] > 1.0).float()
+
+
+def task_arm_support(env, height_gate: float = 0.60) -> torch.Tensor:
+    """Height-gated arm-contact reward (H1-2 recovery paper): while the CoM is
+    low, using elbows/forearms as struts is ENCOURAGED — it fades with height
+    so the final rise is leg-only. Never penalize arm contact on a 60 kg robot
+    with 24 Nm elbows; gate it instead."""
+    contact = (
+        torch.norm(env.simulator.contact_forces[:, env._arm_contact_idx, :], dim=-1) > 1.0
+    ).float().amax(dim=1)
+    h = getup_base_height(env)
+    gate = torch.clamp((height_gate - h) / height_gate, 0.0, 1.0)
+    return contact * gate
+
+
+def getup_stuck_low(env, min_height: float = 0.30, after_s: float = 6.0) -> torch.Tensor:
+    """Recycle hopeless episodes (H1-2's failure signature is 100% stuck-low):
+    still below lying-ish height late in the episode -> reset. Getup task only
+    (a rollover env is SUPPOSED to stay low)."""
+    late = env.episode_length_buf > int(after_s / env.dt)
+    return late & (getup_base_height(env) < min_height)
+
+
 # ---------------------------------------------------------------------------
 # Manager configs
 # ---------------------------------------------------------------------------
@@ -699,11 +810,14 @@ _actor_terms = {
     "dof_pos": ObsTermCfg(func=f"{_L}:dof_pos", scale=1.0, noise=0.01),
     "dof_vel": ObsTermCfg(func=f"{_L}:dof_vel", scale=0.05, noise=0.1),
     "actions": ObsTermCfg(func=f"{_L}:actions", scale=1.0, noise=0.0),
+    # HoST includes beta in s_t; the policy must know its own action scale
+    "action_authority": ObsTermCfg(func="everest_getup:obs_action_authority", scale=1.0, noise=0.0),
 }
 getup_observation = ObservationManagerCfg(
     groups={
+        # history 5: HoST Table III(c) — +1.4 pts flat ground, +30 wall/support
         "actor_obs": ObsGroupCfg(
-            concatenate=True, enable_noise=True, history_length=1, terms=dict(_actor_terms)
+            concatenate=True, enable_noise=True, history_length=5, terms=dict(_actor_terms)
         ),
         "critic_obs": ObsGroupCfg(
             concatenate=True,
@@ -713,6 +827,7 @@ getup_observation = ObservationManagerCfg(
                 **{k: replace(v, noise=0.0) for k, v in _actor_terms.items()},
                 "base_lin_vel": ObsTermCfg(func=f"{_L}:base_lin_vel", scale=2.0, noise=0.0),
                 "base_height": ObsTermCfg(func="everest_getup:obs_base_height", scale=1.0, noise=0.0),
+                "feet_contact": ObsTermCfg(func="everest_getup:obs_feet_contact", scale=1.0, noise=0.0),
             },
         ),
     }
@@ -727,6 +842,7 @@ getup_reward = RewardManagerCfg(
         "task_target_pose": RewardTermCfg(func="everest_getup:task_target_pose", weight=2.5, params={}),
         "task_stand_still": RewardTermCfg(func="everest_getup:task_stand_still", weight=1.5, params={}),
         "task_feet_contact": RewardTermCfg(func="everest_getup:task_feet_contact", weight=0.5, params={}),
+        "task_arm_support": RewardTermCfg(func="everest_getup:task_arm_support", weight=0.3, params={}),
         # -- smoothness / hardware-protection (ramped in by PenaltyCurriculum) --
         "penalty_action_rate": RewardTermCfg(
             func="holosoma.managers.reward.terms.locomotion:penalty_action_rate",
@@ -765,6 +881,9 @@ getup_termination = TerminationManagerCfg(
         "base_velocity": TerminationTermCfg(
             func="everest_getup:getup_base_velocity_exceeded", params={"max_lin_vel": 10.0}
         ),
+        "stuck_low": TerminationTermCfg(
+            func="everest_getup:getup_stuck_low", params={"min_height": 0.30, "after_s": 6.0}
+        ),
     }
 )
 
@@ -774,13 +893,17 @@ getup_command = CommandManagerCfg(
     setup_terms={
         "pose_bank": CommandTermCfg(
             func="everest_getup:PoseBankCommand",
-            params={"categories": _GETUP_CATEGORIES},
+            params={"categories": _GETUP_CATEGORIES, "waypoint_share": 0.25},
         ),
     },
     reset_terms={
         "pose_bank": CommandTermCfg(func="everest_getup:PoseBankCommand"),
     },
     step_terms={},
+)
+
+rollover_termination = TerminationManagerCfg(
+    terms={k: v for k, v in getup_termination.terms.items() if k != "stuck_low"}
 )
 
 rollover_command = CommandManagerCfg(
@@ -880,8 +1003,8 @@ getup_curriculum = CurriculumManagerCfg(
             func="everest_getup:GetupAssistCurriculum",
             params={
                 "step": 0.05,
-                "up_threshold": 0.45,
-                "down_threshold": 0.2,
+                "up_threshold": 0.6,
+                "down_threshold": 0.25,
                 "min_scale": 0.0,
                 "max_scale": 1.0,
                 "interval_resets": 4096,
@@ -957,6 +1080,7 @@ _rollover_experiment_base = replace(
     env_class="everest_getup.A3UltraRolloverManager",
     training=TrainingConfig(project="everest-a3", name="a3_ultra_rollover"),
     simulator=_rollover_sim,
+    termination=rollover_termination,
     command=rollover_command,
     reward=rollover_reward,
     curriculum=rollover_curriculum,

@@ -11,7 +11,7 @@ status: current
 The Everest terrain itself comes from the sibling repo `C:\Users\Aditya\VSCode\GeologicDome` (footage → LingBot-Map reconstruction → sim terrain). This repo consumes that terrain later through the `TerrainSpec`/`TerrainPatch` interface; it does not reproduce that pipeline.
 
 > [!success] Current phase (2026-08-14)
-> **Locomotion works.** The first Lambda run (FastSAC, IsaacSim, 4096 envs, 50 k iterations) produced a policy that walks the full command envelope, and it survives the MuJoCo sim2sim gate untuned: **68/68** on the stability grid against a **26/68** PD-stand control, recovering **2–4 m/s** shoves against a 0.2–0.3 m/s floor. Detail and videos: `docs/sim2sim_locomotion_report.md`, `results/videos/showcase/` (start with `02_vs_floor.mp4` — same push, policy vs floor, side by side), or the [summary page](https://claude.ai/code/artifact/c462411d-4103-4789-8ac2-56c37f443b0a). Next: get-up cloud run (E12/E13), and a locomotion rerun with a heading term to fix the one measured weakness — uncommanded yaw drift ([[baselines]]).
+> **Locomotion works.** The first Lambda run (FastSAC, IsaacSim, 4096 envs, 50 k iterations) produced a policy that walks the full command envelope, and it survives the MuJoCo sim2sim gate untuned: **68/68** on the stability grid against a **26/68** PD-stand control, recovering **2–4 m/s** shoves against a 0.2–0.3 m/s floor. Detail and videos: `docs/sim2sim_locomotion_report.md`, `results/videos/showcase/` (start with `02_vs_floor.mp4` — same push, policy vs floor, side by side), or the [summary page](https://claude.ai/code/artifact/c462411d-4103-4789-8ac2-56c37f443b0a). Next: get-up cloud run (E12/E13), and the **final walking policy** — spec in `docs/final_rl_policy.md` (heading command, velocity estimator, obs history, arm-motion curriculum, CAM reward, height scan; ~16 GPU-h across S0–S4).
 
 ## Roadmap
 
@@ -30,4 +30,5 @@ The Everest terrain itself comes from the sibling repo `C:\Users\Aditya\VSCode\G
 - Choices and their rationale: [[decisions]]
 - Machine/env state: [[setup]]
 - Known unknowns and risks: [[open-questions]]
+- **Building the next walking policy: `docs/final_rl_policy.md`** — the self-contained build spec (S0–S4), start there rather than re-deriving it.
 - Deep detail lives in `docs/` (baseline matrix, bootstrap report, cloud training, ONNX interface, **sim2sim locomotion report**, research reports) and `experiments/README.md` (the E00–E15 ladder definitions).

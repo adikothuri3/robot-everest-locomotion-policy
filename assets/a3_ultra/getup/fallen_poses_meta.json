@@ -14,7 +14,8 @@
     "supine": 565,
     "prone": 613,
     "side_left": 435,
-    "side_right": 407
+    "side_right": 407,
+    "waypoint": 450
   },
   "unsettled_discarded": 28,
   "qpos_layout": "0:3 base pos, 3:7 base quat wxyz (MuJoCo), 7: 29 hinge joints in MJCF TREE order (see hinge_joint_names_tree_order)",
@@ -48,5 +49,10 @@
     "right_knee_joint",
     "right_ankle_pitch_joint",
     "right_ankle_roll_joint"
-  ]
+  ],
+  "waypoint_seeds": {
+    "sit": 150,
+    "kneel": 150,
+    "crouch": 150
+  }
 }
