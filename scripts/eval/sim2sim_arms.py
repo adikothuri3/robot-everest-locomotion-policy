@@ -142,22 +142,32 @@ CONTEXTS = [
 def mask_arm_obs(sim: A3Sim):
     """Hide the moved arms from the policy: report arm dof_pos/dof_vel as default.
 
-    Decisive ablation. The policy owns 29 DOF but its `pose` reward pinned the arms
-    near default in training, so it has effectively never seen a large value on those
-    observation channels. If hiding them rescues the failing skills, the failure is
-    an off-distribution *observation*, not a balance problem — and the fix is cheap.
-    Layout (see evaluation.sim2sim): dof_pos is obs[37:66], dof_vel is obs[66:95],
-    both in canonical dof order, so the 14 arm joints are the last 14 of each block.
+    Decisive ablation, and also the deploy-today contract in
+    `docs/final_rl_policy.md` §2. The v1 policy owns 29 DOF but its `pose` reward
+    pinned the arms near default in training, so it has effectively never seen a
+    large value on those channels. If hiding them rescues the failing skills, the
+    failure is an off-distribution *observation*, not a balance problem.
+
+    Slices come from the policy's own observation layout (`sim.layout`), so this
+    works for a v1 policy (100 dims, no history) and a v2 policy (history-stacked,
+    extra terms) alike — every history frame is masked, and `upper_body_target` is
+    masked too, since on a v2 policy that channel also reports the moved arms.
     """
-    n = sim.policy.n_dof
-    arm0 = n - 14                       # arms are the final 14 canonical DOF
-    # actions(n) + ang_vel(3) + cmd_ang(1) + cmd_lin(2) + cos_phase(2) = n + 8
-    pos_lo, vel_lo = n + 8, 2 * n + 8
+    layout = sim.layout
+    arms = np.asarray(layout.arm_dof_indices, dtype=int)
 
     def transform(obs: np.ndarray) -> np.ndarray:
         out = obs.copy()
-        out[pos_lo + arm0: pos_lo + n] = 0.0   # dof_pos is already default-relative
-        out[vel_lo + arm0: vel_lo + n] = 0.0
+        for name in ("dof_pos", "dof_vel"):
+            term = layout.by_name.get(name)
+            if term is None:
+                continue
+            for frame in range(term.history):
+                lo = term.frame_slice(frame).start
+                out[lo + arms] = 0.0        # dof_pos is already default-relative
+        target = layout.by_name.get("upper_body_target")
+        if target is not None:
+            out[target.start : target.stop] = 0.0
         return out
 
     return transform

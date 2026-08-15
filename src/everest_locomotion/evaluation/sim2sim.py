@@ -9,8 +9,16 @@ so the only difference between training and here is the physics engine:
 * **Rates** — 50 Hz policy (Holosoma: sim 200 Hz / control_decimation 4). MuJoCo
   integrates at the MJCF's 1 ms timestep with decimation 20 (the manifest's
   documented evaluation stack: finer substep, same policy rate).
-* **Observation** — the actor group is concatenated in **alphabetically sorted
-  term order** (`ObservationManager.compute_group`), not config order:
+* **Observation** — the actor vector is **read from the policy**, not hardcoded.
+  `ObservationManager.compute_group` concatenates terms in **alphabetically
+  sorted** order (not config order) and stores history **per term**
+  (``[term_a(t-4..t) | term_b(t-4..t) | ...]``, oldest frame first). Adding one
+  observation term therefore renumbers everything after it.
+
+  v2 policies carry the whole layout in ONNX metadata as ``actor_obs_layout``
+  (written by `holosoma_ext/a3_ultra_loco_v2.py`), so this harness assembles the
+  vector from the policy's own description and cannot fall out of step with it.
+  Policies without that metadata (v1) fall back to `ObsLayout.v1_default`:
 
   | slice | term | dims | scale |
   | --- | --- | --- | --- |
@@ -28,6 +36,16 @@ so the only difference between training and here is the physics engine:
   the offsets to ``[0, -pi]`` and the frequency to ``1/gait_period``; the phase
   advances as ``k * 2*pi*dt*gait_freq + offset`` wrapped to ``[-pi, pi)``, and is
   forced to ``pi`` on both legs whenever the command is ~zero (stand).
+
+  v2 adds three terms this harness reproduces: ``heading_error`` (zero unless the
+  scenario sets `Command.heading`, matching the ~20% of training episodes on pure
+  yaw-rate commands), ``upper_body_target`` (the arm joint target about to be
+  applied, relative to the default pose), and ``height_scan`` (a 13x9 downward
+  grid in the base yaw frame). The scan is read straight off the `TerrainPatch`
+  rather than raycast: the patch **is** the heightfield MuJoCo collides against
+  (`build_model` writes `hfield_data` from it), so a bilinear lookup is exact
+  where `mj_ray` would only be a discretisation of the same surface — and it is
+  two orders of magnitude faster than 117 ray calls per control step.
 * **Action** — the ONNX embeds the observation normalizer and the per-joint
   action bounds, so its output is the *raw* action; the environment applies
   ``target = default_pose + action_scale * action`` and a PD law with the
@@ -55,13 +73,135 @@ from everest_locomotion.terrains.spec import TerrainPatch
 
 HOLOSOMA_MJCF = REPO_ROOT / "assets" / "a3_ultra" / "holosoma" / "a3_ultra_29dof.xml"
 
-# Holosoma runtime constants for this experiment (holosoma_config.yaml of the run).
+# Holosoma runtime defaults. A v2 policy overrides these from its own
+# `actor_obs_layout` metadata (see ObsLayout); they remain the fallback for v1
+# policies and the values every stage trained so far actually used.
 CONTROL_DT = 0.02          # sim.fps 200 / control_decimation 4
 GAIT_PERIOD = 1.0          # command.setup_terms.locomotion_gait.gait_period
 STAND_PHASE_VALUE = math.pi
 CLIP_OBSERVATIONS = 100.0
 ACTION_CLIP_VALUE = 100.0
 SPAWN_HEIGHT = 1.07        # robot.init_state.pos[2]
+
+
+# ---------------------------------------------------------------------------
+# observation layout
+
+
+@dataclass(frozen=True)
+class ObsTerm:
+    """One observation term's placement in the flattened actor vector."""
+
+    name: str
+    group: str
+    dim: int          # per-frame width
+    history: int      # frames stacked, oldest first
+    scale: float
+    start: int        # global start column
+    width: int        # dim * history
+
+    @property
+    def stop(self) -> int:
+        return self.start + self.width
+
+    def frame_slice(self, frame: int) -> slice:
+        """Columns of one history frame (0 = oldest, history-1 = current)."""
+        lo = self.start + frame * self.dim
+        return slice(lo, lo + self.dim)
+
+
+@dataclass
+class ObsLayout:
+    """How to build the actor observation vector for a given policy."""
+
+    terms: list[ObsTerm]
+    total_dim: int
+    control_dt: float = CONTROL_DT
+    clip: float = CLIP_OBSERVATIONS
+    gait_period: float = GAIT_PERIOD
+    command_dim: int = 3
+    scandots: dict | None = None
+    arm_dof_indices: list[int] = field(default_factory=list)
+    source: str = "v1-default"
+
+    def __post_init__(self):
+        self.by_name = {t.name: t for t in self.terms}
+        end = max((t.stop for t in self.terms), default=0)
+        if end != self.total_dim:
+            raise ValueError(
+                f"observation layout is inconsistent: terms end at {end} but the "
+                f"policy declares {self.total_dim} inputs"
+            )
+
+    def has(self, name: str) -> bool:
+        return name in self.by_name
+
+    @property
+    def max_history(self) -> int:
+        return max((t.history for t in self.terms), default=1)
+
+    @classmethod
+    def v1_default(cls, n_dof: int) -> ObsLayout:
+        """The layout every pre-v2 A3 policy was trained with (100 dims @ 29 DOF)."""
+        spec = [
+            ("actions", n_dof, 1.0),
+            ("base_ang_vel", 3, 0.25),
+            ("command_ang_vel", 1, 1.0),
+            ("command_lin_vel", 2, 1.0),
+            ("cos_phase", 2, 1.0),
+            ("dof_pos", n_dof, 1.0),
+            ("dof_vel", n_dof, 0.05),
+            ("projected_gravity", 3, 1.0),
+            ("sin_phase", 2, 1.0),
+        ]
+        terms, cursor = [], 0
+        for name, dim, scale in spec:
+            terms.append(
+                ObsTerm(name, "actor_obs", dim, 1, scale, cursor, dim)
+            )
+            cursor += dim
+        return cls(
+            terms=terms,
+            total_dim=cursor,
+            arm_dof_indices=list(range(n_dof - 14, n_dof)),
+        )
+
+    @classmethod
+    def from_metadata(cls, payload: dict, n_dof: int) -> ObsLayout:
+        """Parse the ``actor_obs_layout`` blob a v2 policy carries."""
+        terms, cursor = [], 0
+        for group in payload["groups"]:
+            hist = int(group["history_length"])
+            for entry in group["terms"]:
+                scale = entry.get("scale", 1.0)
+                if isinstance(scale, (list, tuple)):
+                    scale = float(scale[0])
+                width = int(entry["dim"]) * hist
+                terms.append(
+                    ObsTerm(
+                        name=entry["name"],
+                        group=group["name"],
+                        dim=int(entry["dim"]),
+                        history=hist,
+                        scale=float(scale),
+                        start=cursor,
+                        width=width,
+                    )
+                )
+                cursor += width
+        return cls(
+            terms=terms,
+            total_dim=int(payload.get("total_dim", cursor)),
+            control_dt=float(payload.get("control_dt", CONTROL_DT)),
+            clip=float(payload.get("clip_observations", CLIP_OBSERVATIONS)),
+            gait_period=float(payload.get("gait_period", GAIT_PERIOD)),
+            command_dim=int(payload.get("command_dim", 3)),
+            scandots=payload.get("scandots"),
+            arm_dof_indices=list(
+                payload.get("arm_dof_indices", range(n_dof - 14, n_dof))
+            ),
+            source=payload.get("extension", "actor_obs_layout"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -101,15 +241,30 @@ class HolosomaPolicy:
         )
         self.n_dof = len(self.dof_names)
 
-        expected = 3 * self.n_dof + 3 + 1 + 2 + 2 + 3 + 2
-        if self.obs_dim != expected:
+        # v2 policies describe their own observation vector; v1 policies do not.
+        # Deriving it from the file rather than from a table in this repo is what
+        # stops a new observation term from silently making a good policy look
+        # broken -- which has already cost us one run (docs/final_rl_policy.md §5).
+        if "actor_obs_layout" in meta:
+            self.layout = ObsLayout.from_metadata(
+                json.loads(meta["actor_obs_layout"]), self.n_dof
+            )
+        else:
+            self.layout = ObsLayout.v1_default(self.n_dof)
+
+        if self.obs_dim != self.layout.total_dim:
             raise ValueError(
-                f"{self.path.name}: actor obs dim {self.obs_dim} != expected {expected}; "
-                "the observation term set changed — re-derive the layout before trusting results."
+                f"{self.path.name}: actor obs dim {self.obs_dim} != layout total "
+                f"{self.layout.total_dim} (layout source: {self.layout.source}); "
+                "the observation term set changed — re-derive it before trusting results."
             )
 
+    @property
+    def control_dt(self) -> float:
+        return self.layout.control_dt
+
     def act(self, obs: np.ndarray) -> np.ndarray:
-        x = np.clip(obs, -CLIP_OBSERVATIONS, CLIP_OBSERVATIONS).astype(np.float32)[None]
+        x = np.clip(obs, -self.layout.clip, self.layout.clip).astype(np.float32)[None]
         return self.session.run(None, {self.input_name: x})[0][0].astype(np.float64)
 
 
@@ -184,12 +339,23 @@ class Push:
 
 @dataclass
 class Command:
-    """Velocity command, optionally switching partway through the episode."""
+    """Velocity command, optionally switching partway through the episode.
+
+    Setting ``heading`` (an absolute world yaw, radians) switches the scenario to
+    the heading-regulated mode a v2 policy is trained on for ~80% of episodes: the
+    yaw-rate command becomes ``clip(0.5 * wrap_to_pi(target - yaw), -1, 1)`` and
+    the ``heading_error`` observation carries the residual. Leaving it ``None``
+    keeps the pure yaw-rate mode — which is both what v1 only ever saw and what
+    the other ~20% of v2 episodes train, so existing scenarios stay valid.
+    """
 
     lin_vel_x: float = 0.0
     lin_vel_y: float = 0.0
     ang_vel_yaw: float = 0.0
     schedule: list[tuple[float, tuple[float, float, float]]] = field(default_factory=list)
+    heading: float | None = None
+    heading_gain: float = 0.5
+    heading_clip: float = 1.0
 
     def at(self, t: float) -> np.ndarray:
         cmd = (self.lin_vel_x, self.lin_vel_y, self.ang_vel_yaw)
@@ -197,6 +363,19 @@ class Command:
             if t >= start:
                 cmd = value
         return np.asarray(cmd, dtype=np.float64)
+
+    def regulate(self, cmd: np.ndarray, yaw: float) -> tuple[np.ndarray, float]:
+        """Apply heading regulation; returns (command, heading_error)."""
+        if self.heading is None:
+            return cmd, 0.0
+        err = _wrap_to_pi(self.heading - yaw)
+        cmd = cmd.copy()
+        cmd[2] = float(np.clip(self.heading_gain * err, -self.heading_clip, self.heading_clip))
+        return cmd, err
+
+
+def _wrap_to_pi(angle: float) -> float:
+    return (angle + math.pi) % (2 * math.pi) - math.pi
 
 
 @dataclass
@@ -248,9 +427,14 @@ class A3Sim:
         self.data = mujoco.MjData(self.model)
 
         m = self.model
-        self.decimation = int(round(CONTROL_DT / m.opt.timestep))
-        if abs(self.decimation * m.opt.timestep - CONTROL_DT) > 1e-9:
-            raise ValueError("MJCF timestep does not divide the 20 ms control period")
+        self.layout = policy.layout
+        self.control_dt = policy.control_dt
+        self.decimation = int(round(self.control_dt / m.opt.timestep))
+        if abs(self.decimation * m.opt.timestep - self.control_dt) > 1e-9:
+            raise ValueError(
+                f"MJCF timestep {m.opt.timestep} does not divide the policy's "
+                f"{self.control_dt * 1000:g} ms control period"
+            )
 
         jids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, n) for n in policy.dof_names]
         if min(jids) < 0:
@@ -282,7 +466,61 @@ class A3Sim:
         if added_base_mass_kg:
             self.model.body_mass[self.base_body] += added_base_mass_kg
 
-        self.phase_dt = 2.0 * math.pi * CONTROL_DT / GAIT_PERIOD
+        self.phase_dt = 2.0 * math.pi * self.control_dt / self.layout.gait_period
+        self.arm_idx = np.asarray(self.layout.arm_dof_indices, dtype=int)
+        self._scan_grid = self._build_scan_grid()
+        self._obs_history: dict[str, list[np.ndarray]] = {}
+
+    # -- height scan (v2 component E) ---------------------------------------
+    def _build_scan_grid(self) -> np.ndarray | None:
+        """Base-local (x, y) sample offsets, row-major over x then y — or None."""
+        cfg = self.layout.scandots
+        if cfg is None or not self.layout.has("height_scan"):
+            return None
+        nx, ny, sp = int(cfg["nx"]), int(cfg["ny"]), float(cfg["spacing"])
+        xs = np.linspace(-(nx - 1) / 2 * sp, (nx - 1) / 2 * sp, nx) + float(cfg["x_offset"])
+        ys = np.linspace(-(ny - 1) / 2 * sp, (ny - 1) / 2 * sp, ny)
+        gx, gy = np.meshgrid(xs, ys, indexing="ij")
+        return np.stack([gx.ravel(), gy.ravel()], axis=1)
+
+    def terrain_heights(self, xy: np.ndarray) -> np.ndarray:
+        """Vectorised bilinear terrain height at world XY points, shape (n, 2)."""
+        if self.patch is None:
+            return np.zeros(len(xy))
+        h = self.patch.heights_m
+        sx, sy = self.patch.spec.size_m
+        nx, ny = h.shape
+        fx = np.clip((xy[:, 0] + sx / 2) / sx * (nx - 1), 0, nx - 1.000001)
+        fy = np.clip((xy[:, 1] + sy / 2) / sy * (ny - 1), 0, ny - 1.000001)
+        i, j = fx.astype(int), fy.astype(int)
+        tx, ty = fx - i, fy - j
+        return (
+            h[i, j] * (1 - tx) * (1 - ty)
+            + h[i + 1, j] * tx * (1 - ty)
+            + h[i, j + 1] * (1 - tx) * ty
+            + h[i + 1, j + 1] * tx * ty
+        )
+
+    def height_scan(self) -> np.ndarray:
+        """Base-frame height scan, matching `a3_ultra_loco_v2.height_scan` exactly.
+
+        Yaw-only rotation (a full-quat rotation would tilt the grid with the torso
+        and read the wrong ground patch), heights relative to the nominal standing
+        pelvis height, clipped. No noise/dropout: those are training-time
+        randomisation, and the gate should measure the policy, not the map.
+        """
+        cfg = self.layout.scandots
+        yaw = self._yaw()
+        c, s = math.cos(yaw), math.sin(yaw)
+        g = self._scan_grid
+        pos = self.base_pos()
+        world = np.stack(
+            [pos[0] + c * g[:, 0] - s * g[:, 1], pos[1] + s * g[:, 0] + c * g[:, 1]], axis=1
+        )
+        clip = float(cfg["clip"])
+        return np.clip(
+            pos[2] - float(cfg["nominal_height"]) - self.terrain_heights(world), -clip, clip
+        )
 
     # -- state helpers ------------------------------------------------------
     def base_pos(self) -> np.ndarray:
@@ -350,26 +588,102 @@ class A3Sim:
             SPAWN_HEIGHT + self.terrain_height(0.0, 0.0)
         )
         self.data.qvel[:] = 0.0
+        # History buffers are zero-padded on reset, matching
+        # ObservationManager.reset (buffer.clear(), then zero padding on refill).
+        self._obs_history = {}
         mujoco.mj_forward(self.model, self.data)
 
     # -- observation --------------------------------------------------------
-    def observe(self, prev_action: np.ndarray, step: int, cmd: np.ndarray) -> np.ndarray:
-        dof_pos = self.data.qpos[self.qpos_adr] - self.policy.default_dof_pos
-        dof_vel = self.data.qvel[self.qvel_adr]
-        ph = self.phase(step, cmd)
-        return np.concatenate(
-            [
-                prev_action,                       # actions
-                self.base_ang_vel_body() * 0.25,   # base_ang_vel
-                cmd[2:3],                          # command_ang_vel
-                cmd[0:2],                          # command_lin_vel
-                np.cos(ph),                        # cos_phase
-                dof_pos,                           # dof_pos
-                dof_vel * 0.05,                    # dof_vel
-                self.projected_gravity(),          # projected_gravity
-                np.sin(ph),                        # sin_phase
-            ]
+    def _term_frame(
+        self,
+        name: str,
+        prev_action: np.ndarray,
+        step: int,
+        cmd: np.ndarray,
+        heading_err: float,
+        arm_target_rel: np.ndarray,
+    ) -> np.ndarray:
+        """One unscaled current-frame value for a named observation term."""
+        if name == "actions":
+            return prev_action
+        if name == "base_ang_vel":
+            return self.base_ang_vel_body()
+        if name == "projected_gravity":
+            return self.projected_gravity()
+        if name == "command_lin_vel":
+            return cmd[0:2]
+        if name == "command_ang_vel":
+            return cmd[2:3]
+        if name == "dof_pos":
+            return self.data.qpos[self.qpos_adr] - self.policy.default_dof_pos
+        if name == "dof_vel":
+            return self.data.qvel[self.qvel_adr]
+        if name == "sin_phase":
+            return np.sin(self.phase(step, cmd))
+        if name == "cos_phase":
+            return np.cos(self.phase(step, cmd))
+        if name == "heading_error":
+            return np.array([heading_err])
+        if name == "upper_body_target":
+            return arm_target_rel
+        if name == "height_scan":
+            return self.height_scan()
+        raise KeyError(
+            f"observation term '{name}' is in the policy's layout but this harness "
+            "cannot reproduce it — add it to A3Sim._term_frame before grading."
         )
+
+    def observe(
+        self,
+        prev_action: np.ndarray,
+        step: int,
+        cmd: np.ndarray,
+        heading_err: float = 0.0,
+        arm_target_rel: np.ndarray | None = None,
+    ) -> np.ndarray:
+        if arm_target_rel is None:
+            arm_target_rel = np.zeros(len(self.arm_idx))
+
+        obs = np.empty(self.layout.total_dim)
+        for term in self.layout.terms:
+            frame = np.asarray(
+                self._term_frame(
+                    term.name, prev_action, step, cmd, heading_err, arm_target_rel
+                ),
+                dtype=np.float64,
+            ) * term.scale
+            if frame.shape != (term.dim,):
+                raise ValueError(
+                    f"term '{term.name}' produced {frame.shape}, layout expects ({term.dim},)"
+                )
+            if term.history == 1:
+                obs[term.start : term.stop] = frame
+                continue
+            buf = self._obs_history.setdefault(term.name, [])
+            buf.append(frame)
+            del buf[: max(0, len(buf) - term.history)]
+            pad = term.history - len(buf)
+            obs[term.start : term.stop] = np.concatenate(
+                [np.zeros(pad * term.dim), *buf] if pad else buf
+            )
+        return obs
+
+    def arm_target_rel(self, prev_action: np.ndarray, t: float, target_override) -> np.ndarray:
+        """Arm joint target relative to the default pose, as v2 observes it.
+
+        With no skill attached this is the policy's own last applied arm target
+        (`action_scale * a_{t-1}`), exactly the branch training uses when the
+        policy owns its arms. With a skill attached it is the target the skill is
+        about to apply at time ``t`` — the same one-step-ahead value the training
+        env exposes, because observations are computed after the command manager
+        steps.
+        """
+        if not len(self.arm_idx):
+            return np.zeros(0)
+        target = self.policy.default_dof_pos + self.policy.action_scale * prev_action
+        if target_override is not None:
+            target = target_override(target, t)
+        return (target - self.policy.default_dof_pos)[self.arm_idx]
 
     # -- episode ------------------------------------------------------------
     def run(
@@ -396,13 +710,14 @@ class A3Sim:
         pushes = sorted(pushes or [], key=lambda p: p.time_s)
         self.reset(yaw=spawn_yaw)
 
-        n_control = int(round(duration_s / CONTROL_DT))
+        dt = self.control_dt
+        n_control = int(round(duration_s / dt))
         render_every = 0
         if renderer is not None:
-            render_every = max(1, int(round((1.0 / video_fps) / CONTROL_DT)))
-            if abs(render_every * CONTROL_DT * video_fps - 1.0) > 1e-9:
+            render_every = max(1, int(round((1.0 / video_fps) / dt)))
+            if abs(render_every * dt * video_fps - 1.0) > 1e-9:
                 raise ValueError(
-                    f"video_fps={video_fps} does not divide the {1 / CONTROL_DT:g} Hz "
+                    f"video_fps={video_fps} does not divide the {1 / dt:g} Hz "
                     "control rate — playback would not be real time"
                 )
 
@@ -420,10 +735,16 @@ class A3Sim:
         prev_yaw = self._yaw()
 
         for step in range(n_control):
-            t = step * CONTROL_DT
-            cmd = command.at(t)
+            t = step * dt
+            cmd, heading_err = command.regulate(command.at(t), self._yaw())
 
-            obs = self.observe(prev_action, step, cmd)
+            obs = self.observe(
+                prev_action,
+                step,
+                cmd,
+                heading_err=heading_err,
+                arm_target_rel=self.arm_target_rel(prev_action, t, target_override),
+            )
             if obs_transform is not None:
                 obs = obs_transform(obs)
             if obs_noise > 0.0:
@@ -489,7 +810,7 @@ class A3Sim:
             yaw_now = self._yaw()
             yaw_travelled += (yaw_now - prev_yaw + math.pi) % (2 * math.pi) - math.pi
             prev_yaw = yaw_now
-            yaw_commanded += cmd[2] * CONTROL_DT
+            yaw_commanded += cmd[2] * dt
 
             v_body = self.base_lin_vel_body()
             w_body = self.base_ang_vel_body()

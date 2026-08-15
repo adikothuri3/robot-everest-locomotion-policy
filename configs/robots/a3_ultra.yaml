@@ -14,10 +14,15 @@
 #   assumed  : temporary simulation assumption chosen by this project;
 #              NOT a hardware spec. Every assumed value is marked.
 #
-# Variant note: a3_ultra_t3d0 adds dexterous hands (many finger DOF) and
-# renames head_pitch_joint -> ultra_head_pitch_joint. Locomotion uses
-# T2.5. The base A3 (a3_t2d5/a3_t3d0) shares limb topology; not yet
-# manifested.
+# Variant note: a3_ultra_t3d0 adds dexterous hands (+32 finger DOF, 65
+# bodies) and renames head_pitch_joint -> ultra_head_pitch_joint; its MJCF
+# is not standalone (broken terrain include). DECISION 2026-08-15: this
+# project trains on T2.5 (confirmed with team; see notes/decisions.md).
+# T3.0 COMPATIBILITY GUARANTEE: the 29 trained joints are name-identical
+# across variants (head is frozen in both), so policies trained here deploy
+# on a T3.0 robot unchanged via name-mapped joints, with the hand controller
+# owning the fingers. The base A3 (a3_t2d5/a3_t3d0) shares limb topology;
+# not yet manifested.
 
 robot:
   name: a3_ultra

@@ -4,6 +4,22 @@
 with `notes/overview.md` and this file you have everything needed to execute. It supersedes
 `docs/locomotion_v2_plan.md` (deleted).
 
+> [!success] This spec is implemented (2026-08-15) — not yet trained
+> - **Code:** `src/everest_locomotion/holosoma_ext/a3_ultra_loco_v2.py` — one
+>   `--import-file` extension, six registered experiments
+>   `a3-ultra-loco-v2-{s0,s1,s2,s3,s4,s4-lcp}`.
+> - **Launch:** `bash scripts/cloud/train_a3_v2_cloud.sh s1` (or `all`). Local
+>   MJWarp smoke: `SIMULATOR=mjwarp bash scripts/train/train_a3_wsl.sh v2-s1 ...`.
+> - **Grading:** unchanged commands (§7). The harness now reads each policy's
+>   observation layout out of its own ONNX metadata, so §5's trap 1 is closed
+>   structurally rather than by hand.
+>
+> Four things came out differently from the plan below; each is marked **[built]**
+> in place, and all four are recorded in `notes/decisions.md` 2026-08-15:
+> **no Holosoma fork** (§3B), an upstream **symmetry bug** that §3G would have
+> tripped (§5), and **sign/scale corrections** to the CAM damping and impact
+> penalties (§3D, §4).
+
 **Scope: walking locomotion only.** The get-up policies (`a3-ultra-rollover` +
 `a3-ultra-getup`) are a separate track — see `notes/decisions.md` 2026-08-15 and
 `docs/research/getup_recipes.md`. Nothing here touches them.
@@ -92,7 +108,15 @@ Ordered by value per unit of risk. Each names the exact hook — all verified ag
 
 ### B · Concurrent velocity estimator → fixes the speed undershoot
 
-*Requires a Holosoma fork* (`agents/fast_sac/fast_sac_agent.py`, `fast_sac.py`).
+> [!note] **[built]** No fork was needed
+> `FastSACAlgoConfig._target_` is a plain dotted path resolved by
+> `train_agent.get_class`, so `A3UltraFastSACAgentVelEst` lives in the extension and
+> is selected from config. The head is added by overriding
+> `Actor._setup_network_with_input_dim` / `process_obs`, which means it composes with
+> `CNNActor` for free (S3) **and travels inside the exported ONNX** — so the sim2sim
+> gate runs the estimator without knowing it exists. It regresses the *normalised*
+> privileged `base_lin_vel` slice of `critic_obs` (well-conditioned by construction,
+> no hand-set target scale) and reports `vel_est_rms_ms` in physical units.
 
 - Add a head that predicts base linear velocity (3 dims) from the actor's own observation.
 - Supervise with MSE against `simulator.robot_root_states[:, 7:10]` rotated into the base

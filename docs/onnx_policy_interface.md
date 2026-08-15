@@ -16,9 +16,22 @@ this page if the two ever disagree.
 `ObservationManager.compute_group` does `sorted(obs_tensors.keys())` before
 concatenating, so the actor vector is ordered by term name, not by the order the
 terms appear in `holosoma_config.yaml` (which is dumped alphabetically anyway and
-therefore carries no ordering information).
+therefore carries no ordering information). When a group has
+`history_length > 1`, each term occupies `dim * history` contiguous columns
+**oldest frame first**, and terms are concatenated after that — the vector is
+term-major, not frame-major.
 
-For `a3_ultra_fast_sac` (history_length 1, 29 DOF → **100 dims**):
+> [!tip] v2 policies describe themselves — do not read the table below for them
+> `a3_ultra_loco_v2` policies carry an **`actor_obs_layout`** ONNX metadata blob
+> with every term's name, dim, scale, history and offset (plus control period,
+> gait period, command dim, scandot geometry and the arm DOF indices). See
+> [v2 layout metadata](#v2-layout-metadata). `evaluation/sim2sim.py` builds the
+> observation from that blob and falls back to the table below only when the key
+> is absent. Adding one term renumbers everything after it, so a hand-maintained
+> table is exactly the thing that already cost this project a run.
+
+For `a3_ultra_fast_sac` and `a3_ultra_loco_v2_s0` (history_length 1, 29 DOF →
+**100 dims**):
 
 | slice | term | dims | scale | note |
 | --- | --- | --- | --- | --- |
@@ -74,6 +87,49 @@ training config: `dof_names`, `kp`, `kd`, `action_scale`, `command_ranges`,
 (which is where `init_state.default_joint_angles` comes from). Read the contract from
 the file rather than from a checked-in config — that is what `HolosomaPolicy` does,
 and it is why a mismatched export fails loudly instead of silently.
+
+### v2 layout metadata
+
+`A3UltraFastSACAgent.export` (in `holosoma_ext/a3_ultra_loco_v2.py`) adds one more
+key, `actor_obs_layout`:
+
+```jsonc
+{
+  "groups": [                      // in actor_obs_keys order; concatenated in this order
+    {"name": "actor_obs", "history_length": 5,
+     "terms": [                    // ALREADY alphabetically sorted, with offsets
+       {"name": "actions", "dim": 29, "scale": 1.0, "noise": 0.0, "start": 0, "width": 145},
+       // ... base_ang_vel, command_ang_vel, command_lin_vel, cos_phase, dof_pos,
+       //     dof_vel, heading_error, projected_gravity, sin_phase, upper_body_target
+     ]},
+    {"name": "perception_obs", "history_length": 1,
+     "terms": [{"name": "height_scan", "dim": 117, "scale": 1.0, "start": 0, "width": 117}]}
+  ],
+  "total_dim": 692,
+  "control_dt": 0.02,              // sim.fps / control_decimation — 100 Hz runs land here
+  "clip_observations": 100.0,
+  "gait_period": 1.0,
+  "command_dim": 4,                // 4 once the heading command is on
+  "scandots": {"nx": 13, "ny": 9, "spacing": 0.1, "x_offset": 0.2,
+               "nominal_height": 1.05, "clip": 1.0},
+  "arm_dof_indices": [15, ..., 28],
+  "extension": "a3_ultra_loco_v2"
+}
+```
+
+`start` is relative to its own group; a consumer walks the groups in order and
+accumulates. Actual observed dims per stage: **s0 100, s1 575, s2 645, s3/s4 692**.
+
+The three v2-only terms:
+
+| term | dims | how a consumer produces it |
+| --- | --- | --- |
+| `heading_error` | 1 | `wrap_to_pi(target_yaw - yaw)`, or **0** when the episode is on a pure yaw-rate command (which is ~20% of training episodes, and all of v1's) |
+| `upper_body_target` | 14 | the arm joint target about to be applied, minus the default pose. With no skill attached that is `action_scale * a_{t-1}` on the arm columns |
+| `height_scan` | 117 | 13×9 downward grid in the base **yaw** frame, row-major over (x forward, y lateral), `clip(base_z - nominal_height - ground_z, ±clip)`. Reshapes to the `(1, 13, 9)` CNN encoder input |
+
+The velocity estimator (component **B**) needs nothing from the consumer: its head
+lives **inside** the exported actor, so it is already part of the graph.
 
 ## Consumers
 
