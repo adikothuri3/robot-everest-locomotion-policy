@@ -76,6 +76,34 @@ control). `stability_suite.py` records the floor and nothing else — trained
 policies need the real observation contract, which only the sim2sim harness
 implements (`docs/onnx_policy_interface.md`).
 
+## Shipped policies (start here if you're testing, not training)
+
+Two exported policies are committed so the sim2sim gate runs from a plain clone —
+no cloud box, no training run. Only the **final ONNX + its exact training config**
+ship; `.pt` states and tfevents logs stay out of git (~670 MB).
+
+| Policy | File | Status |
+| --- | --- | --- |
+| Locomotion | `checkpoints/cloud_20260814_012617-a3_ultra_fast_sac-locomotion/model_0050000.onnx` | **Working.** 68/68 sim2sim scenarios vs a 26/68 PD-stand control; 2.5–4.0 m/s recoverable pushes. Report: `docs/sim2sim_locomotion_report.md`. |
+| Get-up (v1) | `checkpoints/v1_getup_28k_plateau/model_27999.onnx` | **Not a deliverable — plateaued at ~30%**, which is roughly the pose bank's supine share. Kept as the evidence that one policy can't cover all fallen postures; that finding drove the rollover/get-up split (`notes/decisions.md`). Don't benchmark against it. |
+
+```powershell
+# clone, install, run the gate — the locomotion policy, 68 scenarios
+git clone https://github.com/adikothuri3/robot-everest-locomotion-policy
+cd robot-everest-locomotion-policy
+py -3.11 -m venv .venv; .venv\Scripts\python -m pip install -e ".[dev]"
+$P = "checkpoints/cloud_20260814_012617-a3_ultra_fast_sac-locomotion/model_0050000.onnx"
+.venv\Scripts\python scripts/eval/sim2sim_suite.py --mode showcase --onnx $P --name colleague-check --video
+```
+
+Each run directory ships `holosoma_config.yaml` — the exact training config that
+produced the ONNX beside it. The observation/action contract the ONNX expects is
+specified in `docs/onnx_policy_interface.md`; the MuJoCo evaluation path does not
+share code with the trainer, which is the point of the gate.
+
+Need the `.pt` states to resume or fine-tune? They aren't in git — ask, and they'll
+go up as release assets.
+
 ## Architecture
 
 ```
@@ -145,3 +173,12 @@ the independent-physics gate → Isaac Lab for PhysX-side articulation checks
 - PD gains, armature, and default pose are **assumptions**, not AgiBot specs (marked in the manifest).
 - Passive PD standing is statically unstable at RL gains (physics, not a bug):
   diagnostics use a documented stiff "hold mode".
+
+## License
+
+Apache-2.0 — see `LICENSE`.
+
+Third-party components are **not** redistributed here; `third_party/` is cloned at
+setup time and gitignored:
+- **AgiBot A3/A3U robot model** ([AgibotTech/A3-A3U-robot-model](https://github.com/AgibotTech/A3-A3U-robot-model)) — Mulan PSL v2. The generated assets in `assets/a3_ultra/holosoma/` are derived from it.
+- **Holosoma** ([amazon-far/holosoma](https://github.com/amazon-far/holosoma)) — Apache-2.0. This repo ships `--import-file` extensions, not a fork.

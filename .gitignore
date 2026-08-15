@@ -10,6 +10,11 @@ __pycache__/
 .pytest_cache/
 .env
 
+# Training runs stay out of git: .pt states are ~18 MB each and tfevents logs
+# reach 56 MB. The SHIPPED policies are the exception — the final .onnx of each
+# run plus its holosoma_config.yaml are force-added (`git add -f`) so colleagues
+# can run the sim2sim gate from a plain clone. Tracked files ignore this rule
+# once added; see README "Shipped policies".
 checkpoints/
 results/
 experiments/*/runs/
