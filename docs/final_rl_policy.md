@@ -164,6 +164,17 @@ Two terms, following the CAM multi-agent work:
 - **Horizontal CAM damping:** `−min(0, Σ_{i∈x,y} k_i · k̇_i)` — penalises build-up of
   horizontal angular momentum, which is what perturbations inject.
 
+> [!warning] **[built]** The damping term as written above has the sign backwards
+> `−min(0, x) = relu(−x)` is positive when momentum is *decaying*, so with the
+> negative weight a penalty carries it rewards build-up. Implemented as
+> `relu(Σ k_i·k̇_i)` with the sign in the weight. It is also normalised
+> (`· dt / cam_ref²`) and clamped — raw `k·k̇` is unbounded and measured O(1e3) on a
+> smoke run, which would have swamped every other term. The **vertical** half's
+> `sigma` and reference amplitude are ASSUMED (no reference motion exists for the
+> A3): check the logged `Env/cam_z` on the first S2 run before reading anything into
+> `rew_cam_tracking`. Only the orbital CAM term is computed; the link-spin term
+> `I_i ω_i` is omitted deliberately (documented in the code).
+
 Compute CAM from `env.simulator._rigid_body_pos` plus body velocities and masses; on IsaacSim
 these come off `_robot.data` (`simulator/isaacsim/isaacsim.py:1038` shows the body-tensor
 pattern). Reported against a fixed-arm baseline: natural arm swing at 1.3 m/s, **+23%
@@ -231,9 +242,9 @@ dimension and the sim2sim harness must be updated in the same commit (§5).
 | Change | Why | Cost |
 | --- | --- | --- |
 | **Terrain: set `smooth_slope` and `rough_slope` to ~0.2 each** | Both are **0.0** today (`flat 0.2 / low_obstacles 0.2 / rough 0.6`). The policy has literally never seen a sustained grade — which is exactly where the alpine scenarios fail. Fix this before blaming the Everest fine-tune. | config only |
-| **100 Hz control** (`control_decimation` 4 → 2) | Doubles correction bandwidth; shows up directly as smoother tracking and better disturbance rejection. Costs sim throughput, not sample efficiency. | ~2× wall clock |
+| **100 Hz control** (`control_decimation` 4 → 2) | Doubles correction bandwidth; shows up directly as smoother tracking and better disturbance rejection. Costs sim throughput, not sample efficiency. **Not enabled by default** — pass `EXTRA_ARGS="--simulator.config.sim.control-decimation 2"`. The control period is written into the ONNX layout metadata, so the sim2sim harness follows automatically. | ~2× wall clock |
 | **Widen the command envelope past ±1.0 m/s** | v1 sits at its command limit at 1.0, which is part of why tracking degrades at the top end. If you want 1.5 m/s, train it. | config only |
-| **Feet air-time + landing-impact rewards** | Neither exists in Holosoma (`managers/reward/terms/locomotion.py` has `feet_phase` only). Impact penalties are what remove hard heel-strike. | 2 new terms |
+| **Feet air-time + landing-impact rewards** | Neither exists in Holosoma (`managers/reward/terms/locomotion.py` has `feet_phase` only). Impact penalties are what remove hard heel-strike. **[built]** in S3+; the impact threshold is ~1.5× body weight (900 N) and the excess is **clamped** — unclamped it reached raw episode sums of ~1e5 on a smoke run. | 2 new terms |
 | **Keep `use_symmetry=True`** | It is on today and worth preserving. New obs terms need a `mirror_obs_<term>` method — monkey-patch it onto `SymmetryUtils` from the extension. The get-up task disabled symmetry rather than do this; do not repeat that. | small |
 
 ---
@@ -254,12 +265,30 @@ cos_phase(2) | dof_pos(29) | dof_vel(29)×0.05 | projected_gravity(3) | sin_phas
 updated **in the same commit** as any observation change. This already cost us once: the doc
 had the order wrong and a correct policy scored as broken.
 
+> [!success] **[built]** Trap 1 is now closed structurally
+> `A3UltraFastSACAgent.export` writes an **`actor_obs_layout`** blob into the ONNX
+> (term names, dims, scales, history, offsets, control period, scandot geometry,
+> arm indices) and `evaluation/sim2sim.py` assembles the observation from it.
+> Policies without the key take `ObsLayout.v1_default`. Verified neutral: v1
+> re-graded through the new harness still scores **68/68**, 0.431 m/s @ 0.5, 0.842
+> @ 1.0, jitter 0.035/0.043. The doc table in `docs/onnx_policy_interface.md` is now
+> a reference, not a dependency.
+
 **2 · `use_symmetry=True` requires `mirror_obs_<name>` per term.**
 The dispatch is `getattr(self, f"mirror_obs_{sub_obs_key}")` in
 `agents/modules/augmentation_utils.py`. A new term without one raises at startup. For the
 14-dim arm target the mirror is the same left/right swap plus sign flips that
 `mirror_action_xz_plane` applies, restricted to arm indices — build it from the robot config's
 `symmetry_joint_names` and `flip_sign_joint_names`.
+
+**3 · `mirror_xz_plane` is wrong whenever `history_length > 1` — [built] patched.**
+`ObservationManager._apply_history` emits `[num_envs, history * term_dim]` **per term**
+and then concatenates terms, i.e. term-major. `SymmetryUtils.mirror_xz_plane` reshapes the
+whole group to `[B, history, single_frame_dim]`, i.e. frame-major. They agree only at
+`history_length == 1`. So **G** + `use_symmetry=True` would have mirrored the wrong columns
+into every augmented sample, silently. The extension monkey-patches a term-major
+implementation onto `SymmetryUtils` at import (a no-op at history 1, so S0/v1 are
+unaffected). Consider reporting upstream to `amazon-far/holosoma`.
 
 ---
 
@@ -286,20 +315,27 @@ be localised without re-running the stages you skipped, which usually ends up sl
 **S0 is not optional.** It is the only thing that proves the refactor is neutral before six
 behavioural changes land on top.
 
-### Where the code goes
+### Where the code goes — **[built]**
 
-- New extension `src/everest_locomotion/holosoma_ext/a3_ultra_loco_v2.py`, self-aliasing into
-  `sys.modules` and importing `a3_ultra_presets` — mirror the header of `a3_ultra_getup.py`.
-- Register experiments `a3-ultra-fast-sac-v2` (and a `-everest` reward variant if wanted).
-- Holosoma fork for **B** (and optionally **F**'s LCP) — keep it as a minimal, documented patch;
-  everything else stays extension-only.
-- Cloud launch via `scripts/cloud/train_a3_cloud.sh` with `EXP` overridden.
+- Extension `src/everest_locomotion/holosoma_ext/a3_ultra_loco_v2.py`, self-aliasing into
+  `sys.modules` as `everest_loco_v2` and importing `a3_ultra_presets` (mirrors the header of
+  `a3_ultra_getup.py`). Everything lives here: env class, command terms, observation terms,
+  reward terms, curricula, symmetry mirrors + the history patch, the FastSAC subclasses, and
+  the six experiment registrations.
+- Experiments `a3-ultra-loco-v2-{s0,s1,s2,s3,s4,s4-lcp}`. No `-everest` reward variant was
+  registered — add one only if S3's slope terrain turns out not to cover the gap.
+- **No Holosoma fork.** `algo._target_` points at `everest_loco_v2.A3UltraFastSACAgent*`.
+- Cloud launch via `scripts/cloud/train_a3_v2_cloud.sh <stage>`; local MJWarp smoke via
+  `SIMULATOR=mjwarp bash scripts/train/train_a3_wsl.sh v2-s1 --training.num-envs 64 ...`.
+- **Stages do not resume from each other** — every stage changes the observation width
+  (s0 100 → s1 575 → s2 645 → s3/s4 692), so each trains from scratch. That is what the
+  cost table above already assumes.
 
 ---
 
 ## 7. How to grade it
 
-The harness exists and needs no changes for S0–S2:
+The harness needs no per-stage flags — it reads each policy's layout from the ONNX:
 
 ```bash
 P=checkpoints/<run>/model_XXXXXXX.onnx
@@ -311,10 +347,28 @@ python scripts/eval/sim2sim_arms.py  --onnx $P                      # arms drive
 python scripts/eval/sim2sim_arms.py  --onnx $P --mask-arm-obs       # ablation
 ```
 
-> [!danger] Blocking dependency before S3
-> Adding scandots means the MuJoCo gate must raycast its own heightfield to build the same
-> 13×9 scan, or **v2 cannot be graded at all**. `A3Sim` already has the terrain patch and
-> MuJoCo exposes `mj_ray`. Build and test this during S2, not when S3 finishes.
+> [!success] **[built]** The S3 blocker is cleared
+> `A3Sim.height_scan` reproduces the same 13×9 yaw-frame grid, reading heights straight off
+> the `TerrainPatch` rather than raycasting: the patch **is** the heightfield `build_model`
+> writes into the MJCF, so a vectorised bilinear lookup is exact where `mj_ray` would only
+> discretise the same surface — and it is two orders of magnitude cheaper than 117 ray calls
+> per control step. Verified: flat ground reads a uniform 0.02 m; a 12° upslope reads a
+> monotone front-to-back gradient matching the terrain profile; rotating the base changes the
+> reading. Noise/dropout are training-only, so the gate measures the policy, not the map.
+> The harness also reproduces `heading_error` (set `Command.heading`) and
+> `upper_body_target`, and `mask_arm_obs` now derives its slices from the layout, so the
+> §2 deploy-today ablation works on a v2 policy too.
+
+Scalars the extension logs, and what each one is for:
+
+| scalar | stage | what it tells you |
+| --- | --- | --- |
+| `vel_est_rms_ms` | S1+ | estimator error in m/s. **Gates S1** — a confidently wrong estimate is worse than none |
+| `vel_est_mse_norm` | S1+ | the same loss in the normalised space it is actually optimised in |
+| `Env/arm_amplitude` | S2+ | must widen past 0.25. If it stalls, standing still became cheaper (§8) |
+| `Env/cam_z`, `Env/cam_xy` | S2+ | the CAM magnitudes. Sanity-check these before trusting `rew_cam_tracking` — its sigma and reference amplitude are ASSUMED |
+| `lcp_penalty` | S4-LCP | the gradient-penalty value. Starts at exactly 0 (zero-initialised `fc_mu`) |
+| `average_episode_length` | all | drives both the penalty curriculum and the arm curriculum |
 
 Fill this in as stages land:
 
