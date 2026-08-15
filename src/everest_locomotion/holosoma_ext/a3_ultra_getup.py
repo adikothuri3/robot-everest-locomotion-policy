@@ -69,7 +69,11 @@ from holosoma.config_values.loco.g1.randomization import g1_29dof_randomization 
 from holosoma.envs.locomotion.locomotion_manager import LeggedRobotLocomotionManager  # noqa: E402
 from holosoma.managers.command.base import CommandTermBase  # noqa: E402
 from holosoma.managers.curriculum.base import CurriculumTermBase  # noqa: E402
-from holosoma.managers.observation.terms.locomotion import get_projected_gravity  # noqa: E402
+from holosoma.managers.observation.terms.locomotion import (  # noqa: E402
+    get_projected_gravity,
+    gravity_vector,
+)
+from holosoma.utils.rotations import quat_rotate_inverse  # noqa: E402
 from holosoma.utils.safe_torch_import import torch  # noqa: E402
 from holosoma.utils.simulator_config import SimulatorType, get_simulator_type  # noqa: E402
 from loguru import logger  # noqa: E402
@@ -183,12 +187,24 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
         pg_z = get_projected_gravity(self)[:, 2]
         lin_vel = torch.norm(self.simulator.robot_root_states[:, 7:10], dim=-1)
         ang_vel = torch.norm(self.simulator.robot_root_states[:, 10:13], dim=-1)
+        success_now = self._task_success_condition(heights, pg_z, lin_vel, ang_vel)
+        self._stand_hold_count = torch.where(
+            success_now, self._stand_hold_count + 1, torch.zeros_like(self._stand_hold_count)
+        )
+        self._ever_success |= self._stand_hold_count >= self.TASK_HOLD_STEPS
+        self.log_dict["getup_success_rate"] = self._success_rate.detach().cpu()
+        self.log_dict["getup_assist_scale"] = torch.tensor(float(self.getup_assist_scale))
+
+    TASK_HOLD_STEPS = HOLD_STEPS
+
+    def _task_success_condition(self, heights, pg_z, lin_vel, ang_vel):
+        """Manifest getup.terminal handoff contract (see constants above)."""
         lw = self._legs_waist_idx
         pose_err = torch.mean(
             torch.abs(self.simulator.dof_pos[:, lw] - self.default_dof_pos[:, lw]), dim=1
         )
         joint_speed = torch.amax(torch.abs(self.simulator.dof_vel[:, lw]), dim=1)
-        standing = (
+        return (
             (heights > SUCCESS_HEIGHT)
             & (pg_z < UPRIGHT_GATE)
             & (lin_vel < SUCCESS_LIN_VEL)
@@ -196,12 +212,6 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
             & (pose_err < SUCCESS_POSE_TOL)
             & (joint_speed < SUCCESS_JOINT_VEL)
         )
-        self._stand_hold_count = torch.where(
-            standing, self._stand_hold_count + 1, torch.zeros_like(self._stand_hold_count)
-        )
-        self._ever_success |= self._stand_hold_count >= HOLD_STEPS
-        self.log_dict["getup_success_rate"] = self._success_rate.detach().cpu()
-        self.log_dict["getup_assist_scale"] = torch.tensor(float(self.getup_assist_scale))
 
     # -- success EMA + counter reset on episode end ---------------------------
     def _reset_buffers_callback(self, env_ids, target_buf=None):
@@ -342,6 +352,91 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
             )
 
 
+class A3UltraRolloverManager(A3UltraGetupManager):
+    """Rollover task: prone (face-down) -> settled supine (face-up).
+
+    The literature never asked one policy to rise from every posture: HumanUP
+    pairs a prone->supine rollover policy (98.3% hardware success) with a
+    supine get-up policy (78.3%), and HoST ships per-posture configs with
+    side-lying handled by the SUPINE policy. This class is the rollover half;
+    a3-ultra-getup trains on supine+sides. No assist force (rolling does not
+    fight gravity the way rising does) and no standing easy-starts.
+    Success = lying flat on the back, settled, held 1 s.
+    """
+
+    TASK_HOLD_STEPS = 50  # 1 s
+
+    def _get_task_name(self) -> str:
+        return "rollover"
+
+    def _task_success_condition(self, heights, pg_z, lin_vel, ang_vel):
+        # supine: base +x points up -> projected gravity x ~ -1 (verified
+        # numerically against the lying_supine keyframe). Base AND torso must
+        # face up (HumanUP's multi-body cosine >= 0.9 criterion).
+        pg_x, torso_pg_x = _faceup_measures(self)
+        return (
+            (pg_x < -0.85)
+            & (torso_pg_x < -0.85)
+            & (heights < 0.45)
+            & (lin_vel < 0.5)
+            & (ang_vel < 1.0)
+        )
+
+    @property
+    def getup_easy_start_prob(self) -> float:
+        return 0.0
+
+    def _apply_assist_force(self):
+        return
+
+
+def _faceup_measures(env):
+    """Base and torso projected-gravity x (face-up when both ~ -1).
+
+    HumanUP's rollover success checks base AND torso AND knee alignment, not
+    just the pelvis — a twisted pose can put the pelvis on its back while the
+    torso is still sideways.
+    """
+    pg_x = get_projected_gravity(env)[:, 0]
+    torso_quat = env.simulator._rigid_body_rot[:, env._torso_body_idx]
+    torso_pg = quat_rotate_inverse(torso_quat, gravity_vector(env), w_last=True)
+    return pg_x, torso_pg[:, 0]
+
+
+def task_supine(env) -> torch.Tensor:
+    """0 face-down, 1 face-up (dense rolling signal; 0.5 on the side).
+
+    Averages base and torso alignment so partial twists read as partial."""
+    pg_x, torso_pg_x = _faceup_measures(env)
+    return (2.0 - pg_x - torso_pg_x) * 0.25
+
+
+def task_roll_rate(env) -> torch.Tensor:
+    """Reward rotation while not yet face-up (HoST's prone config weights its
+    ang-vel style term 25x the supine value — this is the term that makes
+    rolling emerge instead of struggling in place). Gated off once supine."""
+    pg_x, _ = _faceup_measures(env)
+    not_done = (pg_x > -0.7).float()
+    ang = torch.norm(env.simulator.robot_root_states[:, 10:12], dim=-1)
+    return torch.clamp(ang, 0.0, 3.0) * not_done
+
+
+def task_supine_still(env) -> torch.Tensor:
+    """Settle flat on the back (gated stillness, mirrors task_stand_still)."""
+    pg_x, torso_pg_x = _faceup_measures(env)
+    h = getup_base_height(env)
+    gate = ((pg_x < -0.85) & (torso_pg_x < -0.85) & (h < 0.45)).float()
+    lin = torch.sum(env.simulator.robot_root_states[:, 7:10] ** 2, dim=1)
+    ang = torch.sum(env.simulator.robot_root_states[:, 10:13] ** 2, dim=1)
+    return torch.exp(-(lin + 0.2 * ang)) * gate
+
+
+def penalty_rise(env) -> torch.Tensor:
+    """Rollover should roll, not climb: penalize pelvis above lying heights."""
+    h = getup_base_height(env)
+    return torch.clamp((h - 0.45) / 0.30, 0.0, 1.0)
+
+
 # ---------------------------------------------------------------------------
 # Command term: fallen-pose initial states (runs AFTER randomize_dof_state)
 # ---------------------------------------------------------------------------
@@ -363,14 +458,19 @@ class PoseBankCommand(CommandTermBase):
 
         import numpy as np
 
+        categories = tuple(params.get("categories",
+                                      ("supine", "prone", "side_left", "side_right")))
         banks = []
-        for cat in ("supine", "prone", "side_left", "side_right"):
+        for cat in categories:
             arr = np.load(poses_dir / f"fallen_poses_{cat}.npy")
             if len(arr):
                 banks.append(arr)
         bank = np.concatenate(banks, axis=0)
         if len(bank) < 100:
-            raise RuntimeError(f"fallen pose bank too small ({len(bank)}) in {poses_dir}")
+            raise RuntimeError(
+                f"pose bank too small ({len(bank)}) for categories {categories} in {poses_dir}"
+            )
+        self.categories = categories
 
         root_pos = torch.tensor(bank[:, 0:3], dtype=torch.float, device=env.device)
         quat_wxyz = torch.tensor(bank[:, 3:7], dtype=torch.float, device=env.device)
@@ -382,7 +482,7 @@ class PoseBankCommand(CommandTermBase):
         self.bank_dof_pos = dof_pos.contiguous()
         self.joint_noise = float(params.get("joint_noise_rad", 0.05))
         self.num_poses = len(bank)
-        logger.info(f"getup pose bank: {self.num_poses} poses from {poses_dir}")
+        logger.info(f"pose bank: {self.num_poses} poses, categories {self.categories}, from {poses_dir}")
 
     def reset(self, env_ids) -> None:
         env = self.env
@@ -668,14 +768,88 @@ getup_termination = TerminationManagerCfg(
     }
 )
 
+_GETUP_CATEGORIES = ["supine"]  # rollover owns prone AND sides (HoST/HumanUP split)
 getup_command = CommandManagerCfg(
     params={},
     setup_terms={
-        "pose_bank": CommandTermCfg(func="everest_getup:PoseBankCommand", params={}),
+        "pose_bank": CommandTermCfg(
+            func="everest_getup:PoseBankCommand",
+            params={"categories": _GETUP_CATEGORIES},
+        ),
     },
     reset_terms={
         "pose_bank": CommandTermCfg(func="everest_getup:PoseBankCommand"),
     },
+    step_terms={},
+)
+
+rollover_command = CommandManagerCfg(
+    params={},
+    setup_terms={
+        "pose_bank": CommandTermCfg(
+            func="everest_getup:PoseBankCommand",
+            params={"categories": ["prone", "side_left", "side_right"]},
+        ),
+    },
+    reset_terms={
+        "pose_bank": CommandTermCfg(func="everest_getup:PoseBankCommand"),
+    },
+    step_terms={},
+)
+
+rollover_reward = RewardManagerCfg(
+    only_positive_rewards=False,
+    terms={
+        "task_supine": RewardTermCfg(func="everest_getup:task_supine", weight=2.0, params={}),
+        "task_supine_still": RewardTermCfg(func="everest_getup:task_supine_still", weight=1.0, params={}),
+        "task_roll_rate": RewardTermCfg(func="everest_getup:task_roll_rate", weight=0.3, params={}),
+        "penalty_rise": RewardTermCfg(func="everest_getup:penalty_rise", weight=-0.5, params={}),
+        "penalty_action_rate": RewardTermCfg(
+            func="holosoma.managers.reward.terms.locomotion:penalty_action_rate",
+            weight=-1.0, params={}, tags=["penalty_curriculum"],
+        ),
+        "penalty_dof_vel": RewardTermCfg(
+            func="everest_getup:penalty_dof_vel", weight=-5e-3, params={},
+            tags=["penalty_curriculum"],
+        ),
+        "penalty_dof_acc": RewardTermCfg(
+            func="everest_getup:penalty_dof_acc", weight=-1e-6, params={},
+            tags=["penalty_curriculum"],
+        ),
+        "penalty_torques": RewardTermCfg(
+            func="everest_getup:penalty_torques", weight=-0.2, params={"arm_weight": 3.0},
+            tags=["penalty_curriculum"],
+        ),
+        "limits_dof_pos": RewardTermCfg(
+            func="holosoma.managers.reward.terms.locomotion:limits_dof_pos",
+            weight=-10.0, params={"soft_dof_pos_limit": 0.95},
+        ),
+    },
+)
+
+# rollover needs no assist curriculum, only the tracker + penalty ramp
+rollover_curriculum = CurriculumManagerCfg(
+    params={"num_compute_average_epl": 1000},
+    setup_terms={
+        "average_episode_tracker": CurriculumTermCfg(
+            func="holosoma.managers.curriculum.terms.locomotion:AverageEpisodeLengthTracker",
+            params={},
+        ),
+        "penalty_curriculum": CurriculumTermCfg(
+            func="holosoma.managers.curriculum.terms.locomotion:PenaltyCurriculum",
+            params={
+                "enabled": True,
+                "tag": "penalty_curriculum",
+                "initial_scale": 0.1,
+                "min_scale": 0.1,
+                "max_scale": 1.0,
+                "level_down_threshold": 75.0,
+                "level_up_threshold": 200.0,   # 5 s episodes = 250 steps max
+                "degree": 0.001,
+            },
+        ),
+    },
+    reset_terms={},
     step_terms={},
 )
 
@@ -706,8 +880,8 @@ getup_curriculum = CurriculumManagerCfg(
             func="everest_getup:GetupAssistCurriculum",
             params={
                 "step": 0.05,
-                "up_threshold": 0.7,
-                "down_threshold": 0.3,
+                "up_threshold": 0.45,
+                "down_threshold": 0.2,
                 "min_scale": 0.0,
                 "max_scale": 1.0,
                 "interval_resets": 4096,
@@ -770,6 +944,47 @@ _getup_experiment_base = ExperimentConfig(
 )
 
 a3_ultra_getup = EXPERIMENT_REGISTRY.add("a3_ultra_getup", _getup_experiment_base)
+
+_rollover_sim = replace(
+    simulator.isaacsim,
+    config=replace(
+        simulator.isaacsim.config,
+        sim=replace(simulator.isaacsim.config.sim, max_episode_length_s=5.0),
+    ),
+)
+_rollover_experiment_base = replace(
+    _getup_experiment_base,
+    env_class="everest_getup.A3UltraRolloverManager",
+    training=TrainingConfig(project="everest-a3", name="a3_ultra_rollover"),
+    simulator=_rollover_sim,
+    command=rollover_command,
+    reward=rollover_reward,
+    curriculum=rollover_curriculum,
+    algo=replace(
+        algo.ppo,
+        config=replace(
+            algo.ppo.config,
+            num_learning_iterations=10000,  # HumanUP's rollover is the easy half
+            use_symmetry=False,
+        ),
+    ),
+)
+a3_ultra_rollover = EXPERIMENT_REGISTRY.add("a3_ultra_rollover", _rollover_experiment_base)
+a3_ultra_rollover_fast_sac = EXPERIMENT_REGISTRY.add(
+    "a3_ultra_rollover_fast_sac",
+    replace(
+        _rollover_experiment_base,
+        training=TrainingConfig(project="everest-a3", name="a3_ultra_rollover_fast_sac"),
+        algo=replace(
+            algo.fast_sac,
+            config=replace(
+                algo.fast_sac.config,
+                num_learning_iterations=30000,
+                use_symmetry=False,
+            ),
+        ),
+    ),
+)
 
 # FastSAC variant: the repo's proven algo (E00/E01) and the only one that
 # survives MJWarp locally — use for local smoke runs and as an algo ablation

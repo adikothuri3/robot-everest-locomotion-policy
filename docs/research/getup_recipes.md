@@ -105,3 +105,38 @@ asymmetry (arms weak → bias to leg-dominant strategies; waist pitch limit
 Known failure modes: knee/hip saturation at sit-to-squat; kp sim-to-real gap
 (×1.33–1.5); arm/torso contact fidelity; "stands but behaves strangely"
 (HoST #35) — motion quality, not success rate, is the hard part at scale.
+
+## Update 2026-08-15 — the multi-policy architecture (post run #1)
+
+Run #1 (one policy, all postures) plateaued at 30% success ≈ the bank's supine
+share. Deep-dive confirmed the literature predicted this: HoST's limitations
+section states training with supine+prone together "negatively impacted
+performance due to interference between sampled rollouts", and HoST ships one
+policy per posture (`g1_ground`, `g1_ground_prone`, plus per-terrain variants);
+HumanUP ships a prone→supine rollover policy (98.3% hardware) plus a supine
+get-up policy (78.3%). Side-lying coverage in HoST came from the PRONE policy
+zero-shot (its reset code has no roll randomization — sides were generalization).
+
+**Our architecture (implemented in `a3_ultra_getup.py`):**
+- `a3-ultra-rollover`: prone+side starts → settled supine. 5 s episodes, no
+  assist. Success = base AND torso projected-gravity-x < −0.85 (HumanUP's
+  multi-body cosine ≥ 0.9), pelvis < 0.45 m, settled, held 1 s. Rewards: dense
+  face-up cosine (base+torso averaged), gated roll-rate bonus (HoST's prone
+  config weights its ang-vel style term 25× the supine value — the term that
+  makes rolling emerge), settle-on-back stillness, anti-rise penalty, standard
+  smoothness stack under PenaltyCurriculum.
+- `a3-ultra-getup`: supine starts only (+5–30% standing anchors, HumanUP's
+  `standing_init_prob` pattern) → manifest handoff pose. Assist curriculum
+  `up_threshold` 0.45.
+- Runtime router (E14, numbers from the literature): fall = tilt >37°
+  (|pg_z+1|>0.6, SD-AMP) → damp window (Unitree FSM pattern) → chest-up ? getup
+  : rollover; rollover→getup on face-up ≥0.9 held 0.5 s (FRASA debounce);
+  getup→locomotion on handoff gate held 0.5 s, then ready-pose before commands.
+
+**Exploration lesson (why run #1's std collapse wasn't the root cause):** no
+recipe fixes PPO exploration with noise floors; all of them make the task easy
+first — HoST's 200 N pull force, HumanUP's weak-regularization Stage I +
+simplified collisions, HiFAR's sagittal-plane stage + keyframe resets. Our
+assist curriculum plays that role for get-up; the rollover task is dense enough
+(cosine gradient + roll-rate) not to need one. FRASA's CrossQ (max-entropy
+off-policy) is the fallback precedent if discovery still stalls.

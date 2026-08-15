@@ -9,10 +9,19 @@
 #   bash scripts/cloud/train_a3_getup_cloud.sh
 #
 # Environment overrides:
-#   EXP=a3-ultra-getup            (PPO, HoST-parity default)
-#      |a3-ultra-getup-fast-sac   (FastSAC — the repo's proven locomotion algo)
-#   NUM_ENVS=4096   ITERATIONS=20000   SEED=1
+#   EXPS="a3-ultra-rollover a3-ultra-getup"   (default: BOTH policies, in order)
+#     Any subset/order works; -fast-sac variants exist for every task.
+#   NUM_ENVS=4096   ITERATIONS=<n>   SEED=1
 #   WANDB_API_KEY=...           (optional; enables logger:wandb)
+#
+# WHY TWO POLICIES: the literature never made one policy rise from every
+# posture. HumanUP = prone->supine ROLLOVER policy (98.3% on hardware) +
+# supine GET-UP policy (78.3%); HoST = per-posture policies, sides handled by
+# the supine one. Run #1 (single policy, all postures) plateaued at 30% ~= the
+# supine share of our pose bank. So: a3-ultra-rollover trains on prone starts
+# (success = settled on the back, 1 s), a3-ultra-getup trains on supine+side
+# starts (success = locomotion handoff pose, 2 s). At runtime a projected-
+# gravity router chains rollover -> getup -> locomotion.
 #
 # What this trains (see docs/research/getup_recipes.md and the getup extension
 # src/everest_locomotion/holosoma_ext/a3_ultra_getup.py):
@@ -30,8 +39,8 @@
 #
 # Watch during training (TensorBoard: logs/everest-a3/<run>/; env log_dict
 # tags are logged WITHOUT a prefix):
-#   getup_success_rate     -> the metric that matters (target: >0.9); success
-#                             gate == manifest getup.terminal handoff contract
+#   getup_success_rate     -> target >0.95 for rollover (settled-on-back gate),
+#                             >0.9 for getup (manifest handoff-pose gate)
 #   getup_assist_scale     -> must anneal 1.0 -> 0.0 (success without assist
 #                             is the only success that counts)
 #   penalty_scale          -> smoothness ramp (0.1 -> 1.0)
@@ -42,7 +51,7 @@
 # =============================================================================
 set -euo pipefail
 
-EXP="${EXP:-a3-ultra-getup}"
+EXPS="${EXPS:-a3-ultra-rollover a3-ultra-getup}"
 NUM_ENVS="${NUM_ENVS:-4096}"
 # Iteration budgets differ per algo (FastSAC counts differently than PPO):
 # only override the experiment's registered default if ITERATIONS is set.
@@ -109,7 +118,6 @@ assert exp.simulator.config.sim.max_episode_length_s == 10.0
 print("getup experiment config resolves OK:", sorted(exp.reward.terms))
 EOF
 
-echo "== [5/6] Train: $EXP  sim=isaacsim envs=$NUM_ENVS iters=${ITERATIONS:-exp-default} seed=$SEED =="
 LOGGER_ARGS=()
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
   LOGGER_ARGS=(logger:wandb)
@@ -119,20 +127,23 @@ ITER_ARGS=()
 if [[ -n "$ITERATIONS" ]]; then
   ITER_ARGS=(--algo.config.num_learning_iterations "$ITERATIONS")
 fi
-python src/holosoma/holosoma/train_agent.py "exp:$EXP" "${LOGGER_ARGS[@]}" \
-  --import-file "$REPO_DIR/src/everest_locomotion/holosoma_ext/a3_ultra_getup.py" \
-  --training.num_envs "$NUM_ENVS" \
-  --training.seed "$SEED" \
-  "${ITER_ARGS[@]}" \
-  --algo.config.save_interval 2000
+for EXP in $EXPS; do
+  echo "== [5/6] Train: $EXP  sim=isaacsim envs=$NUM_ENVS iters=${ITERATIONS:-exp-default} seed=$SEED =="
+  python src/holosoma/holosoma/train_agent.py "exp:$EXP" "${LOGGER_ARGS[@]}" \
+    --import-file "$REPO_DIR/src/everest_locomotion/holosoma_ext/a3_ultra_getup.py" \
+    --training.num_envs "$NUM_ENVS" \
+    --training.seed "$SEED" \
+    "${ITER_ARGS[@]}" \
+    --algo.config.save_interval 2000
 
-echo "== [6/6] Collect artifacts =="
-RUN_DIR=$(ls -dt "$WORK"/holosoma/logs/everest-a3/*/ | head -1)
-OUT="$REPO_DIR/checkpoints/cloud_getup_$(basename "$RUN_DIR")"
-mkdir -p "$OUT"
-cp "$RUN_DIR"/model_*.pt "$RUN_DIR"/model_*.onnx "$RUN_DIR"/holosoma_config.yaml "$OUT"/ 2>/dev/null || true
-cp "$RUN_DIR"/events.out.tfevents.* "$OUT"/ 2>/dev/null || true
-echo "artifacts in: $OUT"
+  echo "== [6/6] Collect artifacts for $EXP =="
+  RUN_DIR=$(ls -dt "$WORK"/holosoma/logs/everest-a3/*/ | head -1)
+  OUT="$REPO_DIR/checkpoints/cloud_getup_$(basename "$RUN_DIR")"
+  mkdir -p "$OUT"
+  cp "$RUN_DIR"/model_*.pt "$RUN_DIR"/model_*.onnx "$RUN_DIR"/holosoma_config.yaml "$OUT"/ 2>/dev/null || true
+  cp "$RUN_DIR"/events.out.tfevents.* "$OUT"/ 2>/dev/null || true
+  echo "artifacts in: $OUT"
+done
 echo "retrieve with: scp -r <instance>:$OUT ./checkpoints/"
 echo
 echo "Next (locally): cross-physics gate in MuJoCo classic:"
