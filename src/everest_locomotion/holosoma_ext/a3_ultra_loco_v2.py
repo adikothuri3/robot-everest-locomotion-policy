@@ -977,7 +977,7 @@ def penalty_action_jerk(env) -> torch.Tensor:
     return torch.sum(torch.square(d), dim=1)
 
 
-def penalty_arm_off_target(env, max_value: float = 4.0) -> torch.Tensor:
+def penalty_arm_off_target(env, max_value: float = 8.0) -> torch.Tensor:
     """Keep the policy's arm output defined on envs where the skill owns the arms.
 
     **Without this the arm channels are undefined, and undefined means garbage.**
@@ -996,12 +996,23 @@ def penalty_arm_off_target(env, max_value: float = 4.0) -> torch.Tensor:
 
     Zero on policy-owned envs — there the action is applied, so the ordinary
     smoothness and pose terms already constrain it.
+
+    **L1, not squared, and the scale is derived rather than guessed.** Replaying
+    `UpperBodyCommand._sample_pose` against the real joint limits (mean usable
+    half-range 1.84 rad, `action_scale` 0.25) gives a mean |applied| of 0.54
+    action units at 25% amplitude and 2.14 at 100%. A squared error over that
+    range costs 0.39/step at weight -0.1 — **79% of the whole `alive` bonus** —
+    and saturates any sane clamp on 92% of samples, which zeroes the gradient
+    exactly when the arms are moving most. L1 at weight -0.05 costs 0.027/step at
+    25% amplitude and 0.107 at 100% (5% and 21% of `alive`), never clamps, and
+    gives a constant-magnitude restoring gradient, which is what pinning a
+    free-floating channel actually wants. ``max_value`` is a blowup guard only.
     """
     upper = env.command_manager.get_state("upper_body_command")
     if upper is None:
         return torch.zeros(env.num_envs, device=env.device)
     applied = env.action_manager.action[:, env._arm_idx]
-    err = torch.square(env._raw_arm_action - applied).mean(dim=1).clamp(max=max_value)
+    err = (env._raw_arm_action - applied).abs().mean(dim=1).clamp(max=max_value)
     return err * upper.active.float()
 
 
@@ -1492,18 +1503,13 @@ def build_reward(
         # they are unconstrained on 80% of envs and the exported policy's arms are
         # garbage. Not tagged for the penalty curriculum: it must be at full
         # strength from step 0, since it defines the channel rather than shaping it.
-        # Weight scale-checked against the measured S1 budget rather than guessed.
-        # Per control step S1 pays: alive +0.500, action_rate -0.265, feet_phase
-        # +0.222, pose -0.060, tracking_lin +0.058. A typical `err` here is O(1)
-        # (the arm target sits ~1 action unit off the default at 25% amplitude),
-        # so -0.1 costs ~0.10/step — a fifth of the alive bonus, the same order as
-        # `pose`. The first draft of this term was -0.5, which at err=1 would have
-        # consumed the ENTIRE alive bonus and recreated the negative-budget failure
-        # it exists to prevent. These channels currently receive *zero* gradient,
-        # so a small well-scaled one is all that is needed to define them.
+        # Weight derived from the real joint limits, not guessed — see the term's
+        # docstring. Costs 0.027/step at 25% arm amplitude and 0.107 at 100%,
+        # against S1's measured budget of alive +0.500, action_rate -0.265,
+        # feet_phase +0.222, pose -0.060, tracking_lin +0.058.
         terms["penalty_arm_off_target"] = RewardTermCfg(
-            func=f"{_X}:penalty_arm_off_target", weight=-0.1,
-            params={"max_value": 4.0},
+            func=f"{_X}:penalty_arm_off_target", weight=-0.05,
+            params={"max_value": 8.0},
         )
     # Always ours: identical to holosoma's term until an upper-body command exists,
     # then masked to policy-owned channels (`_policy_owned_mask`). Weight and tags
