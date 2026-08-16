@@ -7,7 +7,9 @@ verification trail: `everest_locomotion.evaluation.sim2sim`.
 Modes
   --mode sweep    screen every checkpoint in a run directory, rank, pick a winner
   --mode showcase rich scenario set (flat / rough / slope / friction / pushes /
-                  alpine combo) with per-scenario mp4s and a montage
+                  alpine combo). With --video it writes ONE montage mp4 per run
+                  covering the HIGHLIGHTS cut; --per-scenario-videos opts back in
+                  to a file per scenario
   --mode grid     the 68-scenario stability grid from notes/baselines.md, run for
                   the policy and (with --with-baseline) for the PD-stand control
                   on the same asset, so the comparison is head-to-head
@@ -281,6 +283,12 @@ class StandPolicy:
         self.n_dof = ref.n_dof
         self.obs_dim = ref.obs_dim
         self.iteration = -1
+        # A3Sim assembles observations from the policy's layout even for a policy
+        # that ignores them: borrowing the reference policy's layout keeps the
+        # baseline on the identical control period and observation pipeline, so
+        # the head-to-head comparison differs only in the action.
+        self.layout = ref.layout
+        self.control_dt = ref.control_dt
         self.kp, self.kd = ref.kp.copy(), ref.kd.copy()
         for i, name in enumerate(self.dof_names):
             for key, (kp, kd) in self.HOLD_MIN.items():
@@ -483,7 +491,13 @@ def mode_showcase(args, manifest) -> None:
 
     for sc in scenarios:
         t0 = time.time()
-        result, frames = run_scenario(policy, manifest, sc, args.video, label)
+        # Render only what reaches the montage. A stage produces ONE video; 41
+        # separate mp4s per stage was ~200 MB of files nobody opens, and the
+        # off-screen rendering dominated the run time for scenarios whose frames
+        # were then discarded. `--per-scenario-videos` brings the old files back
+        # when a single case actually needs to be inspected on its own.
+        want_frames = bool(args.video) and (sc.highlight or args.per_scenario_videos)
+        result, frames = run_scenario(policy, manifest, sc, want_frames, label)
         rows.append({"group": sc.group, "caption": sc.caption, **result.as_row()})
         status = "OK  " if result.survived else "FALL"
         print(f"[{status}] {sc.name:26s} velerr={result.lin_vel_error:6.3f} "
@@ -491,14 +505,16 @@ def mode_showcase(args, manifest) -> None:
               f"h={result.mean_base_height:.2f} jit={result.action_jitter:.3f} "
               f"({time.time() - t0:4.1f}s)")
 
-        if args.video and frames:
+        if frames:
             if not result.survived:
                 frames += [frames[-1]] * VIDEO_FPS  # hold the FALL frame for a second
-            write_video(vid_dir / f"{sc.name}.mp4", frames)
+            if args.per_scenario_videos:
+                write_video(vid_dir / f"{sc.name}.mp4", frames)
             if sc.highlight:
                 if sc.group not in group_seen:
                     group_seen.add(sc.group)
                     montage += title_card(sc.group.upper(), GROUP_BLURB.get(sc.group, ""))
+                montage += title_card(sc.name, sc.caption, n_frames=18)
                 montage += frames
 
     n_ok = sum(r["survived"] for r in rows)
@@ -620,7 +636,10 @@ def main() -> None:
     p.add_argument("--onnx", help="exported policy (showcase/grid)")
     p.add_argument("--run-dir", help="checkpoint directory (sweep)")
     p.add_argument("--name", default="sim2sim")
-    p.add_argument("--video", action="store_true")
+    p.add_argument("--video", action="store_true",
+                   help="render ONE montage mp4 covering the highlight scenarios")
+    p.add_argument("--per-scenario-videos", action="store_true",
+                   help="also write a separate mp4 per scenario (~40 files, ~200 MB)")
     p.add_argument("--only", help="comma-separated scenario or group names")
     p.add_argument("--with-baseline", action="store_true",
                    help="also run the PD-stand control through the same grid")

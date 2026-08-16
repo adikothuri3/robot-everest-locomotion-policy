@@ -1,12 +1,55 @@
 ---
 title: Decisions
-updated: 2026-08-15
+updated: 2026-08-16
 status: current
 ---
 
 # Decisions
 
 Newest first. Each entry: what was chosen, why, what was rejected. Add an entry whenever a session makes a call that a future agent might otherwise re-litigate.
+
+## 2026-08-16 — An overridden action channel must still be given a target
+
+**The bug that actually made S2–S4 unusable (0/41 on the showcase, falling in under a second).** Component **C** discards the policy's 14 arm actions on the ~80% of envs an upper-body skill owns, and `_pose_weights(arms_free=True)` zeroed the arm pose weight on *all* envs. Between them, nothing constrained those channels: no gradient from the critic where the action was thrown away, and no pose pull where it was not. They drifted.
+
+Measured open-loop on a textbook standing observation — no simulator, no harness, so this is the policy alone:
+
+| | arm \|a\| mean | arm \|a\| max | non-arm \|a\| mean |
+| --- | --- | --- | --- |
+| S1 | 0.087 | 0.190 | 0.180 |
+| S2 | 5.222 | 10.876 | 0.449 |
+| S3 | 8.105 | 11.479 | 0.470 |
+| S4 | 7.023 | 11.486 | 1.310 |
+
+**The legs were fine.** At `action_scale` 0.25, |a| = 11.5 is a **2.9 rad** arm deflection commanded while standing still — the exported policy throws its arms to the joint limits and falls. In training this was invisible, because the override threw the values away before they reached the simulator; at export nothing overrides them.
+
+**Chosen, two parts:** (1) `pose` is now ownership-masked per env instead of globally released, and the arm weight is *softened* to 5.0 rather than zeroed, so the policy's own arms are still pulled toward the default pose on the envs it owns; (2) a new `penalty_arm_off_target` regresses the policy's raw arm request onto the target actually applied on skill-owned envs, giving the discarded channels a gradient and teaching "output what the arms are doing" — so when the skill detaches, the policy continues from where the arms are instead of snapping.
+
+**Weight scale-checked, not guessed.** Per control step S1 pays alive +0.500, action_rate −0.265, feet_phase +0.222, pose −0.060. The first draft of `penalty_arm_off_target` was −0.5, which at a typical err of 1.0 would have cost 0.50/step — the *entire* alive bonus, recreating the negative-budget failure it exists to prevent. Shipped at **−0.1** (~20% of alive, same order as `pose`). These channels get zero gradient today, so a small well-scaled one is sufficient.
+
+**Interaction worth remembering:** the action-rate mask below, applied *alone*, would have made this worse — it removes the last remaining constraint on the arm channels. The two fixes are only correct together.
+
+**Rule:** if you override an action channel, you have taken away its learning signal. Either exclude it from the action space or give it an explicit target. Never leave it undefined and assume the override will always be there — it will not be at export.
+
+## 2026-08-16 — Never penalise an action channel the policy does not own
+
+**This is what broke S2, S3 and S4** ([[experiments]] E09). `_pre_physics_step` writes the upper-body skill's arm targets *into* the action vector before the action manager stores it — that is deliberate, it is how component **C** makes the arms a disturbance. But `penalty_action_rate` (weight **−2.0**, the third-largest weight in the stack) differences `action_manager.action`, so from S2 on the policy was fined for a 14-joint sinusoid it did not choose and could not reduce. Raw values: **132 (S1) → 571 (S2) → 720 (S4)**. At weight −2.0 that single term exceeded the entire `alive` budget.
+
+**Chosen:** a `_policy_owned_mask` applied to `penalty_action_rate`, `penalty_action_jerk`, `penalty_dof_acc` and `penalty_torques` — zero on the 14 arm channels for exactly the envs where `upper_body_command.active` is true, one everywhere else. With no arm command registered the mask is `None` and all four terms reduce **exactly** to their unmasked form, so S0/S1 stay refactor-neutral (pinned in `tests/test_v2_reward_masking.py`, which asserts equality against holosoma's verbatim `sum((a_t − a_{t−1})²)`).
+
+**Rejected:** dropping the arm channels from the action space at S2+ (changes the ONNX contract mid-ladder and forbids the policy from ever using its arms), and simply lowering the action-rate weight (would have under-penalised the legs to compensate for the arms).
+
+**The general rule, and the reason it went unnoticed for 14 GPU-hours:** every individual term looked plausible in TensorBoard. What was never plotted was their **sum**. `only_positive_rewards=False` and `g1_29dof_termination` has no death penalty, so once net per-step reward went negative (−0.81 at S2, −2.75 at S4, against an `alive` bonus of +0.50) the optimal policy was to *fall over early* — and episode length duly fell 1000 → 801 → 797 → 754 while every reward curve still rose. `Env/net_reward_per_step` is now logged for exactly this. **Check the reward budget's sign, not just its components.**
+
+## 2026-08-16 — S1..S4 share one observation contract so the ladder is a curriculum
+
+**Chosen:** every stage from S1 on carries the same 692-dim actor / 707-dim critic vector (`_LADDER_OBS`), including `upper_body_target` and `height_scan` from S1, and S2+ resume the previous stage's checkpoint via `--training.checkpoint`. Iteration counts become **cumulative** (S1 50k → S2 130k → S3 230k → S4 260k) because `FastSACAgent.load` restores `global_step`.
+
+**Why:** the first ladder trained every stage cold, because each stage widened the observation vector and `FastSACAgent.load` has no padding path — `EmpiricalNormalization.forward` raises on the shape mismatch. The cost was invisible until S4: it got **30k iterations on the hardest configuration in the ladder** and never converged (tracking still oscillating at the final checkpoint). Holding the vector fixed turns four independent runs into one curriculum, and makes S4's small budget correct rather than crippling.
+
+**The two terms S1 does not behaviourally need are still well defined for it:** `upper_body_target` with no command term returns the policy's own last arm action in radians (information it already has via `actions`), and `height_scan` is real terrain under S1's flat/rough mix. So S1 remains the isolation test for A+B+G; it just carries the wider input. **Cost:** ~20% throughput for the CNN encoder path, and S1 must be retrained once at the new width — the current 505-dim S1 checkpoint cannot seed the chain.
+
+**Rejected:** zero-padded weight surgery on the existing 505-dim S1 checkpoint. It would have saved the 3.3 h retrain and is mathematically clean (new columns zero-initialised ⇒ identical function at init), but it needs ~200 lines handling `Actor` vs `CNNActor`, both normalizers, optimizer state and `log_alpha`, with a cold CNN encoder injecting noise into a trained trunk — high risk of a silent degradation next to a cheap, verifiable retrain. Revisit only if GPU hours get tight.
 
 ## 2026-08-15 — Stay on T2.5 despite colleagues using T3.0 (user-confirmed)
 

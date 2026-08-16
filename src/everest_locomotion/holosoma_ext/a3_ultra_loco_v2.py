@@ -278,6 +278,8 @@ class A3UltraLocoV2Manager(LeggedRobotLocomotionManager):
         self._prev_dof_vel = torch.zeros(n, d, device=dev)
         self.dof_acc = torch.zeros(n, d, device=dev)
         self._action_tm2 = torch.zeros(n, d, device=dev)
+        # the policy's own arm request, before the upper-body skill overwrites it
+        self._raw_arm_action = torch.zeros(n, NUM_ARM_DOF, device=dev)
 
         # feet air time / landing impact
         self.feet_air_time = torch.zeros(n, len(self.feet_indices), device=dev)
@@ -362,10 +364,35 @@ class A3UltraLocoV2Manager(LeggedRobotLocomotionManager):
 
         self.log_dict["arm_amplitude"] = torch.tensor(float(self.arm_amplitude))
 
+        # Net reward per step, the metric that makes a negative reward budget
+        # visible immediately. `only_positive_rewards=False` and
+        # `g1_29dof_termination` has no death penalty, so if this goes below zero
+        # the optimal policy is to terminate early and episode length will decay
+        # — which is exactly how S2/S3/S4 failed for 14 GPU-hours while every
+        # individual term still looked plausible. One step stale (`_compute_reward`
+        # runs after this callback), which does not matter for a trend.
+        rew = getattr(self, "rew_buf", None)
+        if rew is not None:
+            self.log_dict["net_reward_per_step"] = rew.mean().detach().cpu()
+
+    def _pose_weight_tensor(self, pose_weights) -> torch.Tensor:
+        """Config-ordered per-DOF pose weights, in this backend's DOF order."""
+        cached = getattr(self, "_pose_w", None)
+        if cached is None:
+            cached = _by_name(self, list(pose_weights)).unsqueeze(0)
+            self._pose_w = cached
+        return cached
+
     def _cam_active(self) -> bool:
+        # Only cache once the reward manager actually exists. Caching a `False`
+        # answer taken before setup finished would silently disable CAM for the
+        # whole run, and `cam_tracking` would then score a permanently-zero
+        # `env.cam` — a plausible-looking constant rather than an error.
         cached = getattr(self, "_cam_active_cached", None)
         if cached is None:
             manager = getattr(self, "reward_manager", None)
+            if manager is None:
+                return False
             terms = set(getattr(manager, "active_terms", []) or [])
             cached = bool(terms & {"cam_tracking", "penalty_cam_damping"})
             self._cam_active_cached = cached
@@ -379,6 +406,15 @@ class A3UltraLocoV2Manager(LeggedRobotLocomotionManager):
 
         upper = self.command_manager.get_state("upper_body_command")
         if upper is not None:
+            # Keep what the POLICY asked for before the skill overwrites it. Those
+            # 14 channels are discarded on skill-owned envs, so they get no
+            # gradient from the critic and nothing else pins them — the first S2
+            # run drifted them to |a| ~ 11 (2.9 rad of arm deflection) while the
+            # legs stayed sane, and the exported policy threw its arms to the
+            # limits and fell in under a second with no skill attached.
+            # `penalty_arm_off_target` regresses them onto the applied target so
+            # the channels stay defined everywhere.
+            self._raw_arm_action[:] = actions[:, self._arm_idx]
             actions = actions.clone()
             target_abs = upper.arm_target  # [N, 14] absolute joint targets (rad)
             scale = self.action_scales[self._arm_idx].unsqueeze(0)
@@ -396,6 +432,14 @@ class A3UltraLocoV2Manager(LeggedRobotLocomotionManager):
         if command is not None and len(command) < commands.shape[1]:
             command = list(command) + [0.0] * (commands.shape[1] - len(command))
         super().set_is_evaluating(command)
+        # `HeadingLocomotionCommand.step` skips yaw regulation while evaluating, so
+        # any env left in heading mode would keep reporting a live `heading_error`
+        # against a yaw command that no longer tracks it — a train/eval mismatch,
+        # and one the sim2sim harness does not reproduce (it holds heading_error at
+        # zero unless a scenario sets `Command.heading`). Drop to pure yaw-rate.
+        term = self.command_manager.get_state("locomotion_command")
+        if isinstance(term, HeadingLocomotionCommand) and term.heading_mode is not None:
+            term.heading_mode[:] = False
 
     # -- checkpointing -------------------------------------------------------
     def get_checkpoint_state(self):
@@ -634,9 +678,19 @@ class ArmAmplitudeCurriculum(CurriculumTermBase):
     """Widen the sampled arm range 25% -> 100% as the policy survives longer.
 
     Same mechanism as `PenaltyCurriculum` (average episode length), because the
-    same signal is what tells us the disturbance is being absorbed. If amplitude
-    never widens, standing still became the cheaper policy — watch the logged
-    `arm_amplitude` against `average_episode_length` (`docs/final_rl_policy.md` §8).
+    same signal is what tells us the disturbance is being absorbed.
+
+    **The thresholds must sit near the episode cap, not merely above the
+    penalty curriculum's.** The first S2 run widened to the 100% maximum and
+    stayed there while the policy was *losing* ground: it ran at ~800 steps
+    against a 1001-step cap, which cleared the old 750 gate on every reset even
+    though a fifth of all episodes were ending in a fall. A gate that a failing
+    policy passes is not a gate. 950/800 means amplitude only grows while the
+    robot is very nearly never falling, and shrinks as soon as it is.
+
+    If amplitude then never widens, standing still became the cheaper policy —
+    watch `Env/arm_amplitude` against `Env/average_episode_length` and
+    `Env/net_reward_per_step` (`docs/final_rl_policy.md` §8).
     """
 
     def __init__(self, cfg, env):
@@ -644,8 +698,8 @@ class ArmAmplitudeCurriculum(CurriculumTermBase):
         p = cfg.params or {}
         self.min_scale = float(p.get("min_scale", 0.25))
         self.max_scale = float(p.get("max_scale", 1.0))
-        self.level_down_threshold = float(p.get("level_down_threshold", 300.0))
-        self.level_up_threshold = float(p.get("level_up_threshold", 750.0))
+        self.level_down_threshold = float(p.get("level_down_threshold", 800.0))
+        self.level_up_threshold = float(p.get("level_up_threshold", 950.0))
         self.degree = float(p.get("degree", 0.001))
         env.arm_amplitude = max(float(p.get("initial_scale", 0.25)), self.min_scale)
 
@@ -673,7 +727,16 @@ def upper_body_target(env) -> torch.Tensor:
     the policy can **anticipate** the motion instead of only reacting to the
     resulting `dof_pos` one step later. For envs where the policy owns its own
     arms it is the policy's own last applied target, which is information it
-    already has (via `actions`) — so no channel is ever privileged or undefined.
+    already has (via `actions`).
+
+    **The two branches are one step apart, and that is deliberate rather than
+    accidental symmetry:** a skill-owned env sees the target for t+1, a
+    policy-owned env sees its own action from t (its t+1 action does not exist
+    yet — the policy is about to produce it). No channel is ever *undefined* or
+    privileged with unobservable state, but the skill-owned branch does carry one
+    step of lookahead. That matches deployment, where a manipulation skill's next
+    target is genuinely known a control period ahead; it is not a training-only
+    advantage the hardware cannot reproduce.
     """
     arms = env._arm_idx
     own = env.action_manager.action[:, arms] * env.action_scales[arms].unsqueeze(0)
@@ -854,16 +917,114 @@ def height_scan(
 # ===========================================================================
 # F · smoothness + §4 reward terms
 # ===========================================================================
+def _policy_owned_mask(env) -> torch.Tensor | None:
+    """``[num_envs, num_dof]`` 1.0 on channels the policy actually chose this step.
+
+    **This is what makes the smoothness penalties honest under component C.**
+    `_pre_physics_step` writes the commanded arm targets *into* the action vector
+    before the action manager stores it, so `action_manager.action` contains the
+    upper-body sinusoid on every env the skill owns. Differencing that vector —
+    which is exactly what `penalty_action_rate` and `penalty_action_jerk` do —
+    charges the policy for a motion it did not choose and cannot reduce.
+
+    Measured on the first S2/S3/S4 runs: raw ``penalty_action_rate`` went
+    132 (S1) -> 571 (S2) -> 720 (S4) at weight -2.0, which by itself exceeded the
+    entire ``alive`` budget and drove net per-step reward negative. With no
+    termination penalty in `g1_29dof_termination`, negative net reward makes
+    *falling over early* the optimal policy, and episode length duly fell
+    1000 -> 801 -> 797 -> 754. See [[experiments]] E09.
+
+    Returns ``None`` when no upper-body command is registered (S0/S1), in which
+    case the terms below reduce **exactly** to holosoma's own
+    ``sum((a_t - a_{t-1})^2)`` and refactor-neutrality is preserved.
+    """
+    upper = env.command_manager.get_state("upper_body_command")
+    if upper is None:
+        return None
+    mask = torch.ones(env.num_envs, env.num_dof, device=env.device)
+    mask[:, env._arm_idx] = (~upper.active).float().unsqueeze(1)
+    return mask
+
+
+def penalty_action_rate(env) -> torch.Tensor:
+    """`sum((a_t - a_{t-1})^2)` over the channels the policy owns.
+
+    Identical to holosoma's `penalty_action_rate` except for the ownership mask
+    (see `_policy_owned_mask`); with no arm command the two are the same function.
+    """
+    d = env.action_manager.action - env.action_manager.prev_action
+    mask = _policy_owned_mask(env)
+    if mask is not None:
+        d = d * mask
+    return torch.sum(torch.square(d), dim=1)
+
+
 def penalty_action_jerk(env) -> torch.Tensor:
     """Second-order action difference: penalise curvature, not motion.
 
     ``penalty_action_rate`` already penalises |a_t - a_{t-1}|, which taxes fast
-    but *steady* motion. This taxes only abrupt changes of rate.
+    but *steady* motion. This taxes only abrupt changes of rate. Masked to
+    policy-owned channels for the same reason (`_policy_owned_mask`) — a commanded
+    sinusoid has large curvature the policy is not responsible for.
     """
     a = env.action_manager.action
     a1 = env.action_manager.prev_action
     a2 = env._action_tm2
-    return torch.sum(torch.square(a - 2.0 * a1 + a2), dim=1)
+    d = a - 2.0 * a1 + a2
+    mask = _policy_owned_mask(env)
+    if mask is not None:
+        d = d * mask
+    return torch.sum(torch.square(d), dim=1)
+
+
+def penalty_arm_off_target(env, max_value: float = 4.0) -> torch.Tensor:
+    """Keep the policy's arm output defined on envs where the skill owns the arms.
+
+    **Without this the arm channels are undefined, and undefined means garbage.**
+    `_pre_physics_step` discards the policy's arm action on `active` envs, so those
+    14 channels receive no gradient from the critic; `_pose_weights(arms_free=True)`
+    removes the only other thing pinning them. On the first S2/S3/S4 runs they drifted
+    to |a| = 5-11 while the legs stayed at |a| ~ 0.5 — invisible in training, because
+    the override threw the values away, and catastrophic at export, where nothing
+    overrides them: the graded policies threw their arms 2.9 rad off the default pose
+    and fell in under a second on every one of the 41 showcase scenarios (0/41).
+
+    The term regresses the policy's *raw* arm request onto the target actually
+    applied, so a skill-owned env teaches "output what the arms are doing". The
+    channels stay in distribution, and when the skill detaches the policy continues
+    from where the arms already are instead of snapping to an arbitrary pose.
+
+    Zero on policy-owned envs — there the action is applied, so the ordinary
+    smoothness and pose terms already constrain it.
+    """
+    upper = env.command_manager.get_state("upper_body_command")
+    if upper is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    applied = env.action_manager.action[:, env._arm_idx]
+    err = torch.square(env._raw_arm_action - applied).mean(dim=1).clamp(max=max_value)
+    return err * upper.active.float()
+
+
+def pose(env, pose_weights) -> torch.Tensor:
+    """holosoma's `pose`, but the arm entries apply only where the policy owns them.
+
+    Upstream sums ``w_j * (q_j - q_default_j)^2`` over all joints with a static
+    per-DOF weight list, so the arm weights are all-or-nothing. Both settings are
+    wrong once component **C** lands: at the preset's weight of 50 the policy is
+    punished for a pose the skill chose and it cannot change, and at 0
+    (`arms_free`) nothing pulls its arms back to a sane place on the envs it *does*
+    own. Ownership is per-env and per-step, so the mask has to be too.
+
+    Identical to upstream whenever no upper-body command is registered, which keeps
+    S0/S1 neutral (asserted against the upstream function in
+    `tests/test_v2_reward_masking.py`).
+    """
+    weights = env._pose_weight_tensor(pose_weights)
+    err = torch.square(env.simulator.dof_pos - env.default_dof_pos) * weights
+    mask = _policy_owned_mask(env)
+    if mask is not None:
+        err = err * mask
+    return torch.sum(err, dim=1)
 
 
 def penalty_dof_acc(env, max_ratio: float = 10.0) -> torch.Tensor:
@@ -878,13 +1039,24 @@ def penalty_dof_acc(env, max_ratio: float = 10.0) -> torch.Tensor:
     """
     acc_limit = env.v2_dof_vel_limits / env.dt
     ratio = (env.dof_acc / acc_limit).abs().clamp(max=max_ratio)
+    mask = _policy_owned_mask(env)
+    if mask is not None:
+        ratio = ratio * mask
     return torch.sum(torch.square(ratio), dim=1)
 
 
 def penalty_torques(env) -> torch.Tensor:
-    """Torque penalty normalised by each joint's effort limit (6 Nm wrists vs 320 Nm knees)."""
+    """Torque penalty normalised by each joint's effort limit (6 Nm wrists vs 320 Nm knees).
+
+    Masked like the other effort terms: holding a commanded arm pose against
+    gravity costs torque the policy did not ask to spend.
+    """
     tau = env.action_manager.get_term("joint_control").torques
-    return torch.sum(torch.square(tau / env.v2_torque_limits), dim=1)
+    ratio = tau / env.v2_torque_limits
+    mask = _policy_owned_mask(env)
+    if mask is not None:
+        ratio = ratio * mask
+    return torch.sum(torch.square(ratio), dim=1)
 
 
 def reward_feet_air_time(env, target_air_time: float = 0.4) -> torch.Tensor:
@@ -1117,7 +1289,10 @@ class A3UltraFastSACAgent(FastSACAgent):
             self._all_reduce_model_grads(self.actor.est_net)
         self.scaler.unscale_(self.est_optimizer)
         self.scaler.step(self.est_optimizer)
-        self.scaler.update()
+        # NO scaler.update() here. `GradScaler.update()` must run once per
+        # iteration, after every optimizer has stepped; `_update_pol` already
+        # called it. Calling it twice moved the loss scale at double rate for no
+        # reason. Infs on this step are caught by the next iteration's update().
         self._est_mse.copy_(est_loss.detach().float())
 
     # -- logging --------------------------------------------------------------
@@ -1267,26 +1442,37 @@ def build_observation(
     }
     if scandots:
         # history_length MUST stay 1: CNNActor reshapes this group to (1, 13, 9)
+        # noise=0.0 is deliberate: `height_scan` already models the elevation map's
+        # own noise, dropout and outliers internally (and disables all three in
+        # eval). A term-level noise on top of that double-counted it — the S3/S4
+        # policies trained against sqrt(0.02^2 + 0.02^2) = 2.8 cm of scan noise
+        # while the docstring and the sim2sim gate both assumed 2 cm.
         groups["perception_obs"] = ObsGroupCfg(
             concatenate=True,
             enable_noise=True,
             history_length=1,
-            terms={"height_scan": ObsTermCfg(func=f"{_X}:height_scan", scale=1.0, noise=0.02)},
+            terms={"height_scan": ObsTermCfg(func=f"{_X}:height_scan", scale=1.0, noise=0.0)},
         )
     return ObservationManagerCfg(groups=groups)
 
 
 def _pose_weights(*, arms_free: bool) -> list[float]:
-    """v1's per-DOF pose weights, with the 14 arm entries optionally released.
+    """v1's per-DOF pose weights, with the 14 arm entries optionally softened.
 
-    Releasing them is not optional once **C** lands: at 50.0 the policy is punished
-    for arm deviation it no longer controls, and would fight the curriculum (and
-    the CAM reward, which pushes the arms the other way).
+    Once **C** lands the arms cannot keep the preset's weight of 50 — the policy
+    would be punished for a pose the skill chose. But zeroing them outright is what
+    let the arm channels drift to |a| ~ 11 (see `penalty_arm_off_target`): on the
+    20% of envs the policy *does* own its arms, nothing pulled them back.
+
+    So the weight is reduced rather than removed, and `pose` masks it per-env by
+    ownership. 5.0 is a tenth of the preset: enough to keep an unowned-by-the-skill
+    arm near the default pose, small enough not to fight the CAM reward, which
+    deliberately asks for arm swing.
     """
     weights = list(g1_29dof_loco_fast_sac.terms["pose"].params["pose_weights"])
     if arms_free:
         for i in ARM_DOF_IDX:
-            weights[i] = 0.0
+            weights[i] = 5.0
     return weights
 
 
@@ -1295,8 +1481,35 @@ def build_reward(
     gait_quality: bool = False,
 ) -> RewardManagerCfg:
     terms = dict(g1_29dof_loco_fast_sac.terms)
+    # Ownership-masked `pose` (identical to upstream with no arm command).
     terms["pose"] = replace(
-        terms["pose"], params={"pose_weights": _pose_weights(arms_free=arms_free)}
+        terms["pose"],
+        func=f"{_X}:pose",
+        params={"pose_weights": _pose_weights(arms_free=arms_free)},
+    )
+    if arms_free:
+        # The discarded arm channels need a gradient of their own — without this
+        # they are unconstrained on 80% of envs and the exported policy's arms are
+        # garbage. Not tagged for the penalty curriculum: it must be at full
+        # strength from step 0, since it defines the channel rather than shaping it.
+        # Weight scale-checked against the measured S1 budget rather than guessed.
+        # Per control step S1 pays: alive +0.500, action_rate -0.265, feet_phase
+        # +0.222, pose -0.060, tracking_lin +0.058. A typical `err` here is O(1)
+        # (the arm target sits ~1 action unit off the default at 25% amplitude),
+        # so -0.1 costs ~0.10/step — a fifth of the alive bonus, the same order as
+        # `pose`. The first draft of this term was -0.5, which at err=1 would have
+        # consumed the ENTIRE alive bonus and recreated the negative-budget failure
+        # it exists to prevent. These channels currently receive *zero* gradient,
+        # so a small well-scaled one is all that is needed to define them.
+        terms["penalty_arm_off_target"] = RewardTermCfg(
+            func=f"{_X}:penalty_arm_off_target", weight=-0.1,
+            params={"max_value": 4.0},
+        )
+    # Always ours: identical to holosoma's term until an upper-body command exists,
+    # then masked to policy-owned channels (`_policy_owned_mask`). Weight and tags
+    # are inherited from the preset so S0/S1 are bit-for-bit the same reward.
+    terms["penalty_action_rate"] = replace(
+        terms["penalty_action_rate"], func=f"{_X}:penalty_action_rate"
     )
     if cam:
         terms["cam_tracking"] = RewardTermCfg(
@@ -1418,8 +1631,9 @@ def build_curriculum(*, arm_curriculum: bool = False) -> CurriculumManagerCfg:
                 "initial_scale": 0.25,
                 "min_scale": 0.25,
                 "max_scale": 1.0,
-                "level_down_threshold": 300.0,
-                "level_up_threshold": 750.0,
+                # near the 1001-step cap on purpose: see ArmAmplitudeCurriculum
+                "level_down_threshold": 800.0,
+                "level_up_threshold": 950.0,
                 "degree": 0.001,
             },
         )
@@ -1519,6 +1733,7 @@ def build_experiment(
     heading: bool = False,
     vel_estimator: bool = False,
     arm_curriculum: bool = False,
+    arm_target_obs: bool | None = None,
     cam: bool = False,
     scandots: bool = False,
     slopes: bool = False,
@@ -1546,7 +1761,7 @@ def build_experiment(
         observation=build_observation(
             history_length=history_length,
             heading=heading,
-            arm_target=arm_curriculum,
+            arm_target=arm_curriculum if arm_target_obs is None else arm_target_obs,
             scandots=scandots,
         ),
         action=action.g1_29dof_joint_pos,
@@ -1585,70 +1800,89 @@ a3_ultra_loco_v2_s0 = EXPERIMENT_REGISTRY.add(
     build_experiment("a3_ultra_loco_v2_s0", iterations=10_000, buffer_size=1024),
 )
 
+# ---------------------------------------------------------------------------
+# S1..S4 share ONE observation contract (692 actor / 707 critic) so each stage
+# can CONTINUE the previous stage's weights instead of restarting from scratch.
+#
+# Why this matters: `FastSACAgent.load` restores actor, critic, both optimizers,
+# log_alpha, both observation normalizers and `global_step`, but it has no
+# padding path — a stage whose observation vector is one term wider than the
+# checkpoint's simply cannot load it (`EmpiricalNormalization.forward` raises on
+# the shape mismatch). The first ladder therefore trained every stage cold, which
+# is why S4 got 30k iterations on the hardest configuration in the whole ladder
+# and never converged. Holding the observation fixed converts the ladder from
+# four independent runs into one curriculum.
+#
+# The two terms S1 does not behaviourally need are still *well defined* for it:
+#   `upper_body_target` with no `upper_body_command` registered returns the
+#     policy's own last arm action in radians — information it already has.
+#   `height_scan` is real terrain under S1's flat/rough mix; component E is the
+#     slope terrain and the reward changes, not the existence of the input.
+# So S1 is still the isolation test for A + B + G; it just carries the wider
+# input from the start. Cost: ~20% throughput for the CNN encoder path.
+#
+# `iterations` is CUMULATIVE from S2 on, because `global_step` resumes from the
+# checkpoint: S2 at 130_000 means "run to 130k", i.e. 80k more than S1's 50k.
+# ---------------------------------------------------------------------------
+_LADDER_OBS = dict(
+    history_length=5,
+    heading=True,
+    vel_estimator=True,
+    arm_target_obs=True,
+    scandots=True,
+    lin_vel_x=(-1.0, 1.5),
+)
+
 # S1 — A heading + B estimator + G history(5), and the widened command envelope.
 # Gate: yaw drift < 1 deg/s; speed within 5% at 0.5 and 1.0; rew_tracking_ang_vel
-# >= 0.8; vel_est_rms_ms logged and falling.
+# >= 0.8; vel_est_rms_ms logged and falling. Trains from scratch; everything
+# after it continues from this checkpoint.
 a3_ultra_loco_v2_s1 = EXPERIMENT_REGISTRY.add(
     "a3_ultra_loco_v2_s1",
-    build_experiment(
-        "a3_ultra_loco_v2_s1",
-        iterations=50_000,
-        history_length=5,
-        heading=True,
-        vel_estimator=True,
-        lin_vel_x=(-1.0, 1.5),
-    ),
+    build_experiment("a3_ultra_loco_v2_s1", iterations=50_000, **_LADDER_OBS),
 )
 
 # S2 — C arm curriculum + D CAM (+ arm pose weights -> 0, same change).
-# Gate: arm suite >= 26/28 WITHOUT observation masking; no regression on the grid.
+# Continues S1. Gate: arm suite >= 26/28 WITHOUT observation masking; no
+# regression on the grid; `Env/net_reward_per_step` stays positive.
 a3_ultra_loco_v2_s2 = EXPERIMENT_REGISTRY.add(
     "a3_ultra_loco_v2_s2",
     build_experiment(
         "a3_ultra_loco_v2_s2",
-        iterations=80_000,
-        history_length=5,
-        heading=True,
-        vel_estimator=True,
+        iterations=130_000,  # cumulative: S1's 50k + 80k
         arm_curriculum=True,
         cam=True,
-        lin_vel_x=(-1.0, 1.5),
+        **_LADDER_OBS,
     ),
 )
 
-# S3 — E height scan + slope terrain.
+# S3 — E slope terrain + the gait-quality pair (the scan input is already there
+# from S1; what lands here is terrain the policy has never seen).
 # Gate: clears the 3 alpine combos v1 fails; rough d1.0 lin-vel err <= 0.15.
-# BLOCKING: the MuJoCo gate must raycast its own 13x9 scan first (built in S2).
 a3_ultra_loco_v2_s3 = EXPERIMENT_REGISTRY.add(
     "a3_ultra_loco_v2_s3",
     build_experiment(
         "a3_ultra_loco_v2_s3",
-        iterations=100_000,
-        history_length=5,
-        heading=True,
-        vel_estimator=True,
+        iterations=230_000,  # cumulative: S2's 130k + 100k
         arm_curriculum=True,
         cam=True,
-        scandots=True,
         slopes=True,
         gait_quality=True,
-        lin_vel_x=(-1.0, 1.5),
+        **_LADDER_OBS,
     ),
 )
 
 # S4 — F smoothness, two arms of one ablation. Gate: jitter down >= 30% with
 # tracking within 5% of S3. If S4 costs tracking, keep S3.
+# 30k *additional* iterations is now defensible: S4 continues S3 rather than
+# starting cold, which is what made the first S4 run undertrained.
 _s4_common = dict(
-    iterations=30_000,
-    history_length=5,
-    heading=True,
-    vel_estimator=True,
+    iterations=260_000,  # cumulative: S3's 230k + 30k
     arm_curriculum=True,
     cam=True,
-    scandots=True,
     slopes=True,
     gait_quality=True,
-    lin_vel_x=(-1.0, 1.5),
+    **_LADDER_OBS,
 )
 a3_ultra_loco_v2_s4 = EXPERIMENT_REGISTRY.add(
     "a3_ultra_loco_v2_s4",

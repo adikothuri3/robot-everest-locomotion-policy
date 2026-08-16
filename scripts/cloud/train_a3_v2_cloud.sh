@@ -17,17 +17,24 @@
 # (a transient death at hour 6 would otherwise cost every remaining stage); the
 # run prints a QUEUE SUMMARY at the end saying which stages produced artifacts.
 #
-# Stages (each is graded against v1 and promoted only if it wins):
-#   s0       every feature OFF                      10k   ~35 min
-#   s1       + heading, velocity estimator, history 50k   ~2.7 h
-#   s2       + arm curriculum, CAM                  80k   ~4.3 h
-#   s3       + height scan, slope terrain          100k   ~5.4 h+
-#   s4       + smoothness reward terms              30k   ~1.6 h
-#   s4-lcp   + Lipschitz penalty (ablation)         30k   ~3-4 h (eager, fp32)
+# Stages (each is graded against v1 and promoted only if it wins). Iteration
+# counts for s2+ are CUMULATIVE, because a resumed run continues `global_step`:
+#   s0       every feature OFF                    ->  10k   ~35 min   (standalone)
+#   s1       + heading, velocity estimator, history ->  50k   ~3.3 h   (from scratch)
+#   s2       + arm curriculum, CAM               -> 130k   ~4.3 h    (continues s1)
+#   s3       + slope terrain, gait quality       -> 230k   ~5.4 h    (continues s2)
+#   s4       + smoothness reward terms           -> 260k   ~1.6 h    (continues s3)
+#   s4-lcp   + Lipschitz penalty (ablation)      -> 260k   ~3-4 h (eager, fp32)
 #
-# STAGES ARE NOT RESUMED FROM EACH OTHER. Every stage changes the observation
-# vector (s0 100 dims -> s1 575 -> s2 645 -> s3 692), so no checkpoint transfers.
-# Each stage trains from scratch; that is what the cost model already assumes.
+# S1..S4 SHARE ONE OBSERVATION CONTRACT (692 actor / 707 critic) precisely so
+# that each stage can continue the previous one's weights. `FastSACAgent.load`
+# restores actor, critic, optimizers, log_alpha, both normalizers and
+# `global_step`, but has no padding path for a widened observation — so holding
+# the vector fixed is what makes the ladder a curriculum instead of four
+# unrelated runs. s0 is the odd one out (100 dims): it is the refactor-neutrality
+# control against v1 and is never resumed from or into.
+#
+# Start mid-ladder with RESUME_FROM=<previous stage's model_*.pt>.
 #
 # Environment overrides:
 #   NUM_ENVS=4096   SEED=1   SIMULATOR=isaacsim
@@ -114,6 +121,14 @@ echo
 echo "== queue: ${STAGES[*]} =="
 
 SUMMARY=()
+# S1..S4 share one observation contract, so each stage CONTINUES the previous
+# stage's weights (see the ladder comment in a3_ultra_loco_v2.py). PREV_CKPT is
+# the .pt the next stage resumes from; RESUME_FROM seeds it when you start the
+# queue mid-ladder, e.g.
+#   RESUME_FROM=checkpoints/cloud_..._s1-locomotion/model_0050000.pt \
+#     bash scripts/cloud/train_a3_v2_cloud.sh s2 s3 s4
+PREV_CKPT="${RESUME_FROM:-}"
+
 for STAGE in "${STAGES[@]}"; do
   EXP="a3-ultra-loco-v2-${STAGE}"
   echo
@@ -124,6 +139,25 @@ for STAGE in "${STAGES[@]}"; do
   if [[ -n "${ITERATIONS:-}" ]]; then
     ITER_ARGS=(--algo.config.num-learning-iterations "$ITERATIONS")
   fi
+
+  # s0 is the standalone neutrality control and s1 is the root of the chain;
+  # neither ever resumes. s2+ resume from whatever the previous stage produced.
+  RESUME_ARGS=()
+  case "$STAGE" in
+    s0|s1) ;;
+    *)
+      if [[ -n "$PREV_CKPT" ]]; then
+        RESUME_ARGS=(--training.checkpoint "$PREV_CKPT")
+        echo "     resuming from: $PREV_CKPT"
+      else
+        echo "!! $EXP has no checkpoint to continue from — it would train from"
+        echo "   scratch with a cumulative iteration count and waste the run."
+        echo "   Pass RESUME_FROM=<path to the previous stage's model_*.pt>."
+        SUMMARY+=("$STAGE  SKIPPED (no checkpoint to resume)")
+        continue
+      fi
+      ;;
+  esac
 
   # A stage that dies must not take the rest of an overnight queue with it: a
   # transient failure at hour 6 would otherwise cost every remaining stage. Record
@@ -136,6 +170,7 @@ for STAGE in "${STAGES[@]}"; do
     --training.num-envs "$NUM_ENVS" \
     --training.seed "$SEED" \
     "${ITER_ARGS[@]}" \
+    "${RESUME_ARGS[@]}" \
     ${EXTRA_ARGS:-}
   RC=$?
   set -e
@@ -159,6 +194,16 @@ for STAGE in "${STAGES[@]}"; do
   cp "$RUN_DIR"/events.out.tfevents.* "$OUT"/ 2>/dev/null || true
   echo "$COMMIT_SHA" > "$OUT/CODE_COMMIT"
   echo "artifacts in: $OUT"
+
+  # hand the highest-iteration checkpoint to the next stage (sort -V so
+  # model_0100000 beats model_0090000 instead of losing on string order)
+  NEXT_CKPT=$(ls -1 "$RUN_DIR"/model_*.pt 2>/dev/null | sort -V | tail -1)
+  if [[ -n "$NEXT_CKPT" ]]; then
+    PREV_CKPT="$NEXT_CKPT"
+  else
+    echo "!! no .pt produced by $EXP — the next stage will have nothing to resume"
+    PREV_CKPT=""
+  fi
   SUMMARY+=("$STAGE  ok -> checkpoints/$(basename "$OUT")")
 done
 
