@@ -139,8 +139,23 @@ CONTEXTS = [
 ]
 
 
-def mask_arm_obs(sim: A3Sim):
+def mask_arm_obs(sim: A3Sim, *, state: bool = True, target: bool = True):
     """Hide the moved arms from the policy: report arm dof_pos/dof_vel as default.
+
+    Two *separate* channels carry the moved arms, and they answer different
+    questions, so they can be masked independently:
+
+    * ``state`` — the arm entries of `dof_pos`/`dof_vel`: where the arms **are**,
+      i.e. the disturbance after the fact.
+    * ``target`` — `upper_body_target` (v2 only): where the arms are **going**,
+      the skill's next commanded pose, available one control step early.
+
+    Masking both is the v1 deploy contract (`docs/final_rl_policy.md` §2) and took
+    v1 from 17/28 to 28/28. Masking neither is what a v2 policy was trained on.
+    The two mixed conditions are the interesting ones: if `state`-only masking
+    rescues a v2 policy, the arms hurt as an *observed disturbance* and the intent
+    channel is fine; if `target`-only masking rescues it, the policy is being
+    thrown by a commanded pose far outside its training distribution.
 
     Decisive ablation, and also the deploy-today contract in
     `docs/final_rl_policy.md` §2. The v1 policy owns 29 DOF but its `pose` reward
@@ -158,19 +173,30 @@ def mask_arm_obs(sim: A3Sim):
 
     def transform(obs: np.ndarray) -> np.ndarray:
         out = obs.copy()
-        for name in ("dof_pos", "dof_vel"):
-            term = layout.by_name.get(name)
-            if term is None:
-                continue
-            for frame in range(term.history):
-                lo = term.frame_slice(frame).start
-                out[lo + arms] = 0.0        # dof_pos is already default-relative
-        target = layout.by_name.get("upper_body_target")
-        if target is not None:
-            out[target.start : target.stop] = 0.0
+        if state:
+            for name in ("dof_pos", "dof_vel"):
+                term = layout.by_name.get(name)
+                if term is None:
+                    continue
+                for frame in range(term.history):
+                    lo = term.frame_slice(frame).start
+                    out[lo + arms] = 0.0    # dof_pos is already default-relative
+        if target:
+            t = layout.by_name.get("upper_body_target")
+            if t is not None:
+                out[t.start : t.stop] = 0.0
         return out
 
     return transform
+
+
+#: The 2x2 of what the policy is told about arms a skill is driving.
+ARM_OBS_MODES = {
+    "full":   dict(state=False, target=False),  # as trained (v2) / as shipped (v1)
+    "none":   dict(state=True, target=True),    # the v1 deploy contract
+    "state":  dict(state=True, target=False),   # hide where they ARE, keep intent
+    "target": dict(state=False, target=True),   # keep state, hide the intent
+}
 
 
 def arm_mass_report(sim: A3Sim) -> dict:
@@ -224,10 +250,16 @@ def main() -> None:
     p.add_argument("--duration", type=float, default=12.0)
     p.add_argument("--name", default="arm_skills")
     p.add_argument("--mask-arm-obs", action="store_true",
-                   help="hide the moved arms from the policy's observation (ablation)")
+                   help="shorthand for --arm-obs none (the v1 deploy contract)")
+    p.add_argument("--arm-obs", choices=sorted(ARM_OBS_MODES), default="full",
+                   help="what the policy is told about skill-driven arms: "
+                        "full=everything (as trained), none=nothing, "
+                        "state=hide dof_pos/dof_vel only, target=hide upper_body_target only")
     p.add_argument("--amplitude-sweep", action="store_true",
                    help="find the largest survivable arm deviation, unmasked")
     args = p.parse_args()
+    mode = "none" if args.mask_arm_obs else args.arm_obs
+    print(f"arm observation mode: {mode}  ({ARM_OBS_MODES[mode]})")
 
     manifest = load_manifest()
     policy = HolosomaPolicy(args.onnx)
@@ -255,7 +287,8 @@ def main() -> None:
                 command=cmd,
                 name=f"{ctx_name}/{skill.name}",
                 target_override=skill.make_override(sim),
-                obs_transform=mask_arm_obs(sim) if args.mask_arm_obs else None,
+                obs_transform=(None if mode == "full"
+                               else mask_arm_obs(sim, **ARM_OBS_MODES[mode])),
             )
             rows.append({"context": ctx_name, "skill": skill.name,
                          "description": skill.description, **res.as_row()})

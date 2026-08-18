@@ -20,7 +20,7 @@ The Everest terrain itself comes from the sibling repo `C:\Users\Aditya\VSCode\G
 | Milestone | What "done" means | Status |
 | --- | --- | --- |
 | M0 Bootstrap | asset validated, training stack runs, floors recorded | done 2026-08-13 |
-| M1 Locomotion | A3 walks smoothly on flat + rough (E02–E06), beats PD-stand floor on the stability suite | done 2026-08-14 — 68/68 vs 26/68 ([[experiments]]) |
+| M1 Locomotion | A3 walks smoothly on flat + rough (E02–E06), beats PD-stand floor on the stability suite | done 2026-08-14 — 68/68 vs 26/68; **improved 2026-08-18 to v2 S1**, 38/41 showcase ([[baselines]]) |
 | M2 Get-up | A3 rises from supine/prone/side ≥90% in sim (E11–E13, HoST recipe) | in progress — two runs wedged, cause found and fixed 2026-08-16 ([[decisions]]) |
 | M3 Handoff | fall → get up → walk chained in MuJoCo gate (E14) | blocked on M2 |
 | M4 Everest fine-tune | both policies fine-tuned on GeologicDome terrain (E10/E15) | blocked on terrain handoff; gap now measured, not assumed |

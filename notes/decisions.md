@@ -8,6 +8,51 @@ status: current
 
 Newest first. Each entry: what was chosen, why, what was rejected. Add an entry whenever a session makes a call that a future agent might otherwise re-litigate.
 
+## 2026-08-18 — Upper-body skills are a physics disturbance, never an action override (user decision)
+
+**Chosen:** every policy from here on keeps **all 29 action channels**. An upper-body skill is injected as an external disturbance at the actuation/physics level — the policy's arm targets are no longer overwritten in `_pre_physics_step`. The policy owns its arms and must *reject* the skill's motion the way it rejects a push or a payload.
+
+**Why the override approach has to go.** It was never a tuning problem; it removes the learning signal from 14 of 29 outputs:
+
+1. Discarded channels are undefined channels. On ~80% of envs the arm action was thrown away before reaching the simulator, so it got no gradient. The first ladder drifted them to |a| ≈ 11 (2.9 rad) while the legs stayed at 0.45, and the exported policies scored **0/41** — they threw their arms to the limits and fell in under a second, because at export nothing overrides anything.
+2. The patch worked, but only on survival. Ownership-masked `pose` + `penalty_arm_off_target` took S2–S4 from 0/41 to **68/68** on the grid and put the reward budget back in the black. It did not fix the thing component **C** exists for.
+3. **The arm curriculum made arm-skill robustness worse, in every observation treatment.** The 3x4 ablation ([[experiments]] E09c) is unambiguous — S4, the only policy explicitly trained with arms driven and told their target one step early, is the worst policy in all four modes and never clears 16/28. v1, which has no arm channel at all, hits 28/28.
+
+|  | full | none | state-hidden | target-hidden |
+| --- | --- | --- | --- | --- |
+| v1 (no target channel) | 17/28 | **28/28** | 28/28 | 17/28 |
+| S1 (channel, no skill in training) | 14/28 | **28/28** | 19/28 | 8/28 |
+| S4 (full arm curriculum) | 13/28 | 16/28 | 10/28 | 6/28 |
+
+The diagnosis the table supports: component **C** taught a *narrow* compensation. `UpperBodyCommand` trains 0.2–2.0 Hz sinusoids and held poses; the arm suite throws 3 Hz swings and 0.5 s slams between joint extremes. S4 leans into arm motion it can predict, and that response is actively wrong for motion it cannot — worse than no response. Information was never the problem: the harness feeds the skill's real target into `upper_body_target` and S4 still scored 13/28.
+
+**Rejected:** (a) widening `UpperBodyCommand` to match the eval suite's frequency and slams — it treats the symptom and leaves the discarded-channel defect in place, so the arm outputs still need `penalty_arm_off_target` propping them up; (b) keeping the override with a stronger regulariser — the same objection, one layer down.
+
+**Consequences to work through when this is built:** `penalty_arm_off_target` and the ownership masks in `pose` / `penalty_action_rate` / `penalty_action_jerk` / `penalty_dof_acc` / `penalty_torques` all exist *because* channels were being discarded. With no override, the policy owns every channel and most of that machinery should be deleted rather than carried forward — but `_policy_owned_mask` returning `None` already makes them exact no-ops, so removal is cleanup, not a behaviour change. Whether `upper_body_target` stays in the observation is a separate question ([[open-questions]]).
+
+## 2026-08-18 — Ship S1; components C, E and F are not promoted
+
+**Chosen:** `cloud_20260817_043529-a3_ultra_loco_v2_s1/model_0045000.onnx` is the locomotion policy. It beats v1 on every measured axis and is the first policy to improve on the M1 floors:
+
+| | v1 | **S1** |
+| --- | --- | --- |
+| Stability grid | 68/68 | 68/68 |
+| Extended showcase | 37/41 | **38/41** (clears `alpine_combo`, which v1 never has) |
+| Arm suite, both channels masked | 28/28 | **28/28** |
+| sim2sim lin-vel error | — | **0.148** |
+| sim2sim ang-vel error | — | **0.144** |
+| action jitter | — | **0.032** |
+| velocity-estimator RMS | n/a | 0.041 m/s |
+
+**S2–S4 are not promoted, and each failed its own gate**, not a gate invented after the fact:
+* **S2** — "arm suite >= 26/28 unmasked" -> **13/28**. See the decision above.
+* **S3** — "clears the 3 alpine combos v1 fails" -> clears none, and adds regressions on `friction_mu0.2` and `push_front_2`. 35/41, the weakest of the four.
+* **S4** — "jitter down >= 30% vs S3" -> jitter went **up**, 0.069 -> 0.082. The smoothness stack produced the jitteriest policy in the set.
+
+S4 is not worthless: 38/41, the best angular error in the project (0.127), and the only policy that clears `alpine_descent`. It is a real candidate for the alpine work later; it is not the general-purpose walker.
+
+**The masking contract survives for S1 and only for S1.** I expected the E08b contract to break on v2 because v2 policies are trained on `upper_body_target` — true for S4 (16/28), false for S1 (28/28), which carries the channel but never saw a skill drive it. If you mask, **mask both channels**: for S1, hiding the target alone (8/28) is worse than hiding nothing (14/28), because displaced arms with a zeroed target is an incoherent pair of inputs.
+
 ## 2026-08-18 — Never gate a curriculum on a metric that curriculum suppresses
 
 **The bug that wedged the v3 get-up run for 14k iterations and 1.37B samples.** The action-authority curriculum (HoST's β) started at 2.0 — double the deployable action scale — and annealed only when the assist curriculum's rose proxy cleared its threshold. But β 2.0 *by itself* makes the terminal state unholdable: measured on a standing spawn with a real policy and **zero exploration noise**, mean `max|dof_vel|` over legs+waist is **1.36 rad/s** against `SUCCESS_JOINT_VEL` 1.0, so the six-way gate passes 0.2% of steps (at β 1.0: 596 consecutive steps held, jvel 0.016). β pinned `getup_success_rate` at exactly 0, the rose proxy sat in the curriculum's dead band, so β never annealed. No exit.

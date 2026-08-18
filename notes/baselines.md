@@ -1,6 +1,6 @@
 ---
 title: Baselines & Scope
-updated: 2026-08-14
+updated: 2026-08-18
 status: current
 ---
 
@@ -51,13 +51,42 @@ not just beat:
 | Max recoverable push, walking | n/a (PD stand cannot walk) | **2.5–4.0 m/s** |
 | Extended showcase (41 scenarios) | — | **37/41** |
 
-> [!warning] Angular tracking is the weak axis
-> `rew_tracking_ang_vel` finished at 0.559 against the 0.8 threshold the run's own config
-> declares, and the gate measures 3–6°/s of uncommanded yaw drift. Linear tracking clears
-> its gate comfortably (1.272 vs 0.95). The recipe has no heading observation, so heading
-> error integrates by construction — fix on the next run, not by re-tuning this one.
-
 The four failures are `friction_mu0.1` and the three *combined* alpine scenarios
 (rough + slope + low friction + gusts). Each ingredient alone is survivable, which makes
 the alpine fine-tune (M4) a measured gap rather than an assumed one.
 Full detail: `docs/sim2sim_locomotion_report.md`; videos in `results/videos/showcase/`.
+
+## Current locomotion policy, 2026-08-18 — v2 **S1**
+
+`checkpoints/cloud_20260817_043529-a3_ultra_loco_v2_s1-locomotion/model_0045000.onnx`
+([[decisions]], [[experiments]] E09b). **These are the numbers to hold now, not v1's.**
+
+| Measure | v1 `model_0050000` | **S1 `model_0045000`** |
+| --- | --- | --- |
+| Stability grid (68 scenarios) | 68/68 | **68/68** |
+| Extended showcase (41 scenarios) | 37/41 | **38/41** |
+| Arm suite, both arm channels masked | 28/28 | **28/28** |
+| sim2sim lin-vel error | — | **0.148** |
+| sim2sim ang-vel error | — | **0.144** |
+| Action jitter | — | **0.032** |
+| Velocity-estimator RMS | n/a | **0.041 m/s** |
+
+S1 clears `alpine_combo`, which v1 never has; its remaining failures are `friction_mu0.1`,
+`alpine_combo_hard` and `alpine_descent`. It adds a heading command, a concurrent velocity
+estimator, 5-frame observation history and scandots over v1, and widens the command
+envelope to +1.5 m/s.
+
+> [!warning] Angular tracking is still the weak axis on the *reward*
+> `rew_tracking_ang_vel` finished at **0.538** for S1 against the 0.8 threshold its own
+> config declares — no better than v1's 0.559, even though the heading command was added
+> to fix exactly that. The sim2sim angular error *did* improve (0.406 → 0.144 over
+> training), so the reward scalar and the defect it was written for have come apart.
+> S3 and S4 are the first runs to clear 0.8 (0.821 / 0.843) but neither is promoted.
+> Decide whether that threshold is still the right gate before the next run
+> ([[open-questions]]).
+
+> [!info] S2–S4 exist and are not promoted
+> All three hold 68/68 on the grid but each failed its own gate: arm suite 13/28 (needs
+> 26), alpine combos 0/3, and jitter *up* 0.069 → 0.082 where S4 promised −30%. S4 is
+> still the best angular tracker in the project (0.127) and the only policy that clears
+> `alpine_descent` — keep it in mind for M4, not for general walking.
