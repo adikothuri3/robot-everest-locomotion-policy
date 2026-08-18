@@ -10,6 +10,8 @@ tests pin both halves of that contract, plus the neutrality that keeps the
 recorded 68/68 locomotion gate valid.
 """
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -112,3 +114,64 @@ def test_harness_can_reproduce_every_v3_getup_observation_term(sim):
             np.zeros(len(sim.arm_idx)),
         )
         assert np.asarray(frame).shape == (term.dim,), term.name
+
+
+# -- the success gates must be reachable ------------------------------------
+#
+# A gate no policy can satisfy reports 0 forever and reads as "the policy is
+# broken". That is what pinned `getup_success_rate` at 0 for two cloud runs, so
+# every gate this repo scores against gets a reachability test.
+
+
+@pytest.fixture(scope="module")
+def rollover_term(sim):
+    import mujoco  # noqa: F401  (imported for parity with the grader)
+    sys.path.insert(0, str(REPO_ROOT / "scripts" / "eval"))
+    import getup_video
+
+    return getup_video.RolloverTerminal(load_manifest(), sim.policy), getup_video
+
+
+def _settle(sim, qpos, steps=50):
+    import mujoco
+
+    sim.reset_fallen(qpos) if hasattr(sim, "reset_fallen") else None
+    for _ in range(steps):
+        mujoco.mj_step(sim.model, sim.data)
+
+
+def test_rollover_gate_accepts_its_own_target_state(rollover_term):
+    """Settled supine poses ARE the rollover terminal state; the gate must pass them."""
+    term, gv = rollover_term
+    sim = gv.GetupSim(HolosomaPolicy(GETUP), load_manifest())
+    bank = np.load(REPO_ROOT / "assets" / "a3_ultra" / "getup" / "fallen_poses_supine.npy")
+    rng = np.random.default_rng(0)
+    ok = 0
+    for idx in rng.choice(len(bank), 20, replace=False):
+        _settle(sim, bank[idx])
+        ok += term.check(sim)[0]
+    # Not 20/20: a few bank poses settle twisted (torso off-axis), which the
+    # base-AND-torso criterion is right to reject.
+    assert ok >= 15, f"only {ok}/20 settled supine poses satisfy the rollover gate"
+
+
+def test_rollover_gate_rejects_the_state_it_rolls_out_of(rollover_term):
+    term, gv = rollover_term
+    sim = gv.GetupSim(HolosomaPolicy(GETUP), load_manifest())
+    bank = np.load(REPO_ROOT / "assets" / "a3_ultra" / "getup" / "fallen_poses_prone.npy")
+    rng = np.random.default_rng(1)
+    rejected = 0
+    for idx in rng.choice(len(bank), 20, replace=False):
+        _settle(sim, bank[idx])
+        rejected += not term.check(sim)[0]
+    assert rejected == 20, f"{20 - rejected}/20 prone poses wrongly pass the rollover gate"
+
+
+def test_the_two_gates_are_not_interchangeable(rollover_term):
+    """Grading one task with the other's gate is the trap this flag exists to avoid."""
+    term, gv = rollover_term
+    assert gv.TERMINALS["getup"] is gv.Terminal
+    assert gv.TERMINALS["rollover"] is gv.RolloverTerminal
+    # rollover wants the pelvis LOW, get-up wants it HIGH — opposite directions
+    getup = gv.Terminal(load_manifest(), HolosomaPolicy(GETUP))
+    assert term.height_max < getup.height - getup.height_tol

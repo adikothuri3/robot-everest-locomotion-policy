@@ -1,20 +1,26 @@
-"""Roll out an exported get-up policy from the fallen-pose bank and record video.
+"""Roll out an exported get-up or rollover policy from the fallen-pose bank, on video.
 
-The locomotion suite (`sim2sim_suite.py`) cannot grade get-up: every scenario it
-owns spawns the robot standing and drives it with velocity commands, and the
-get-up actor has neither command nor gait-phase observations. This script is the
-get-up equivalent — same MuJoCo physics, same PD/action contract, but episodes
-start from a real fallen pose in `assets/a3_ultra/getup/` and success is the
-manifest's `getup.terminal` gate.
+The locomotion suite (`sim2sim_suite.py`) cannot grade either: every scenario it
+owns spawns the robot standing and drives it with velocity commands, and these
+actors have neither command nor gait-phase observations. This script is the
+equivalent — same MuJoCo physics, same PD/action contract, but episodes start
+from a real fallen pose in `assets/a3_ultra/getup/`.
 
     python scripts/eval/getup_video.py --onnx checkpoints/v1_getup_28k_plateau/model_27999.onnx
-    python scripts/eval/getup_video.py --onnx <ckpt> --postures supine --episodes 8
+    python scripts/eval/getup_video.py --onnx <ckpt> --task rollover
     python scripts/eval/getup_video.py --onnx <ckpt> --action-authority 1.0   # deploy scale
 
-Success requires *holding* the handoff pose (the locomotion policy's expected
-initial state) for `hold_time_s`, not merely passing through it — a robot that
-lurches upright and topples is a failure, which is the distinction that matters
-when reading a get-up video.
+**`--task` picks the success gate, and the two are unrelated.** Get-up scores the
+manifest's `getup.terminal` handoff contract: pelvis at 1.063 m, near the default
+pose, held 2 s. Rollover scores `A3UltraRolloverManager`'s: base *and* torso
+face-up, pelvis **below** 0.45 m, settled, held 1 s — the two gates are close to
+opposites, so grading a rollover checkpoint on the get-up gate reports 0/N for a
+policy that is working perfectly. Defaults follow the task (postures, episode
+length, output name), so `--task rollover` needs no other flags.
+
+Success requires *holding* the terminal state for `hold_time_s`, not merely
+passing through it — a robot that lurches upright and topples is a failure, which
+is the distinction that matters when reading one of these videos.
 
 **The action map is not in the ONNX.** `A3UltraGetupManager._pre_physics_step`
 multiplies every action by `getup_action_authority` (2.0 early, annealing to the
@@ -180,6 +186,12 @@ def resolve_action_map(policy: HolosomaPolicy, manifest, override: float | None)
 class Terminal:
     """The manifest's get-up terminal gate, evaluated per control step."""
 
+    name = "getup"
+    postures = "supine"
+    duration_s = 10.0
+    banner = "STOOD UP"
+    summary = "reached and held the handoff pose"
+
     def __init__(self, manifest, policy: HolosomaPolicy):
         cfg = manifest.raw["getup"]["terminal"]
         self.height = float(manifest.raw["default_pose"]["base_height_m"])
@@ -217,6 +229,88 @@ class Terminal:
         )
         return ok, {"z": z, "pose_err": pose_err, "lin": lin, "jvel": jv}
 
+    def describe(self) -> str:
+        return (f"hold {self.hold_time:.0f}s at {self.height:.2f} +/- "
+                f"{self.height_tol:.2f} m, pose <= {self.pose_tol} rad, "
+                f"|v| <= {self.lin_vel_max} m/s")
+
+    def overlay_rows(self, m: dict) -> list[str]:
+        return [
+            f"pelvis   {m['z']:.2f} m   (target {self.height:.2f})",
+            f"tilt     {m['tilt']:4.1f}deg",
+            f"pose err {m['pose_err']:.2f} rad",
+        ]
+
+
+class RolloverTerminal:
+    """`A3UltraRolloverManager._task_success_condition`, evaluated in MuJoCo.
+
+    Rollover is scored on a *completely different* criterion from get-up:
+    settled face-up and still, pelvis LOW. Grading a rollover checkpoint with
+    the get-up handoff gate reports 0/N for a perfectly good policy — the same
+    class of measurement error that made the v3 get-up run unreadable, so the
+    two gates are kept explicitly separate here.
+    """
+
+    name = "rollover"
+    postures = "prone,side_left,side_right"   # rollover owns these; supine is already done
+    duration_s = 5.0                           # max_episode_length_s for the rollover exp
+    banner = "ON ITS BACK"
+    summary = "rolled face-up and settled"
+
+    # verbatim from the training env
+    faceup_tol = -0.85       # base AND torso projected-gravity x
+    height_max = 0.45
+    lin_vel_max = 0.5
+    ang_vel_max = 1.0
+    hold_time = 1.0          # TASK_HOLD_STEPS = 50 @ 50 Hz
+
+    def __init__(self, manifest, policy: HolosomaPolicy):
+        self.torso_name = manifest.raw["bodies"]["torso"]
+        self._torso_id = None
+
+    def _torso_pg_x(self, sim: GetupSim) -> float:
+        if self._torso_id is None:
+            self._torso_id = mujoco.mj_name2id(
+                sim.model, mujoco.mjtObj.mjOBJ_BODY, self.torso_name
+            )
+            if self._torso_id < 0:
+                raise SystemExit(f"torso body {self.torso_name!r} missing from the MJCF")
+        rot = sim.data.xmat[self._torso_id].reshape(3, 3)
+        return float((rot.T @ np.array([0.0, 0.0, -1.0]))[0])
+
+    def check(self, sim: GetupSim) -> tuple[bool, dict]:
+        pg_x = float(sim.projected_gravity()[0])
+        torso_pg_x = self._torso_pg_x(sim)
+        z = float(sim.base_pos()[2])
+        lin = float(np.linalg.norm(sim.data.qvel[0:3]))
+        ang = float(np.linalg.norm(sim.data.qvel[3:6]))
+        ok = (
+            pg_x < self.faceup_tol
+            and torso_pg_x < self.faceup_tol
+            and z < self.height_max
+            and lin < self.lin_vel_max
+            and ang < self.ang_vel_max
+        )
+        return ok, {"z": z, "pg_x": pg_x, "torso_pg_x": torso_pg_x,
+                    "lin": lin, "ang": ang, "pose_err": float("nan"),
+                    "jvel": float("nan")}
+
+    def describe(self) -> str:
+        return (f"hold {self.hold_time:.0f}s face-up (base AND torso "
+                f"proj-gravity x < {self.faceup_tol}), pelvis < {self.height_max} m, "
+                f"|v| < {self.lin_vel_max} m/s, |w| < {self.ang_vel_max} rad/s")
+
+    def overlay_rows(self, m: dict) -> list[str]:
+        return [
+            f"pelvis   {m['z']:.2f} m   (max {self.height_max:.2f})",
+            f"face-up  base {m['pg_x']:+.2f}  torso {m['torso_pg_x']:+.2f}",
+            f"         both need < {self.faceup_tol}",
+        ]
+
+
+TERMINALS = {"getup": Terminal, "rollover": RolloverTerminal}
+
 
 # ---------------------------------------------------------------------------
 # rendering
@@ -239,7 +333,7 @@ class Overlay:
         self.title_font, self.font, self.small = make_font(24), make_font(18), make_font(15)
         self.frames: list[np.ndarray] = []
 
-    def __call__(self, frame, t, m: dict, held: float, done: bool):
+    def __call__(self, frame, t, m: dict, held: float, done: bool, term=None):
         from PIL import Image, ImageDraw
 
         img = Image.fromarray(frame)
@@ -250,20 +344,16 @@ class Overlay:
         d.text((16, 64), f"A3 Ultra · get-up · {self.policy_label} · MuJoCo (sim2sim)",
                font=self.small, fill=(140, 150, 165))
 
-        lines = [
-            f"t        {t:5.2f} s",
-            f"pelvis   {m['z']:.2f} m   (target {m['target_z']:.2f})",
-            f"tilt     {m['tilt']:4.1f}°",
-            f"pose err {m['pose_err']:.2f} rad",
-            f"hold     {held:4.2f} / {m['hold_need']:.1f} s",
-        ]
+        lines = [f"t        {t:5.2f} s"]
+        lines += term.overlay_rows(m)
+        lines.append(f"hold     {held:4.2f} / {term.hold_time:.1f} s")
         h = 20 * len(lines) + 16
-        d.rectangle([0, img.height - h, 340, img.height], fill=(12, 14, 18, 190))
+        d.rectangle([0, img.height - h, 360, img.height], fill=(12, 14, 18, 190))
         for i, line in enumerate(lines):
             d.text((16, img.height - h + 8 + 20 * i), line, font=self.font,
                    fill=(235, 235, 235))
         if done:
-            d.text((img.width - 150, 104), "STOOD UP", font=self.title_font,
+            d.text((img.width - 210, 104), term.banner, font=self.title_font,
                    fill=(120, 230, 140))
         self.frames.append(np.asarray(img))
 
@@ -334,9 +424,9 @@ def run_episode(sim: GetupSim, policy: HolosomaPolicy, term: Terminal, qpos: np.
         if renderer is not None and step % render_every == 0:
             camera.lookat[:] = sim.base_pos()
             m2 = dict(m, tilt=math.degrees(math.acos(
-                np.clip(-sim.projected_gravity()[2], -1.0, 1.0))),
-                target_z=term.height, hold_need=term.hold_time)
-            overlay(sim._render(renderer, camera), t, m2, held, success_t is not None)
+                np.clip(-sim.projected_gravity()[2], -1.0, 1.0))))
+            overlay(sim._render(renderer, camera), t, m2, held,
+                    success_t is not None, term)
 
     return {
         "success": success_t is not None,
@@ -355,11 +445,16 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--onnx", required=True)
-    p.add_argument("--postures", default="supine,prone,side_left,side_right",
-                   help="comma-separated; the pose bank's categories")
+    p.add_argument("--task", choices=sorted(TERMINALS), default="getup",
+                   help="which success gate to score against. The two are entirely "
+                        "different criteria — a rollover policy graded on the get-up "
+                        "gate reads 0/N even when it is perfect.")
+    p.add_argument("--postures", default=None,
+                   help="comma-separated pose-bank categories; default depends on --task")
     p.add_argument("--episodes", type=int, default=3, help="episodes per posture")
-    p.add_argument("--duration", type=float, default=10.0, help="episode seconds")
-    p.add_argument("--name", default="getup")
+    p.add_argument("--duration", type=float, default=None,
+                   help="episode seconds; default is the task's max_episode_length_s")
+    p.add_argument("--name", default=None)
     p.add_argument("--no-video", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--action-authority", type=float, default=None,
@@ -370,7 +465,10 @@ def main() -> None:
 
     manifest = load_manifest()
     policy = HolosomaPolicy(args.onnx)
-    term = Terminal(manifest, policy)
+    term = TERMINALS[args.task](manifest, policy)
+    postures = args.postures if args.postures is not None else term.postures
+    duration = args.duration if args.duration is not None else term.duration_s
+    name = args.name if args.name is not None else term.name
     amap = resolve_action_map(policy, manifest, args.action_authority)
     label = f"iter {policy.iteration}" if policy.iteration >= 0 else Path(args.onnx).stem
     label += f" · beta {amap['action_authority']:.2f} · unassisted"
@@ -390,8 +488,8 @@ def main() -> None:
         print(f"assist   trained with assist_scale {amap['trained_assist_scale']:.2f} "
               f"({amap['trained_assist_scale'] * 350:.0f} N torso pull); "
               "this rollout is UNASSISTED")
-    print(f"gate     hold {term.hold_time:.0f}s at {term.height:.2f} +/- {term.height_tol:.2f} m, "
-          f"pose <= {term.pose_tol} rad, |v| <= {term.lin_vel_max} m/s\n")
+    print(f"task     {term.name}")
+    print(f"gate     {term.describe()}\n")
 
     model = build_model(None)
     if record:
@@ -409,7 +507,7 @@ def main() -> None:
 
     montage: list[np.ndarray] = []
     rows = []
-    for posture in [s.strip() for s in args.postures.split(",") if s.strip()]:
+    for posture in [s.strip() for s in postures.split(",") if s.strip()]:
         bank = load_poses(posture)
         picks = rng.choice(len(bank), size=min(args.episodes, len(bank)), replace=False)
         if record:
@@ -417,14 +515,14 @@ def main() -> None:
                                   f"{len(bank)} settled poses in the bank")
         for k, idx in enumerate(picks):
             ov = Overlay(f"{posture.replace('_', ' ')} — episode {k + 1}",
-                         f"fallen pose #{idx} · policy must reach and hold the handoff pose",
+                         f"fallen pose #{idx} · must {term.summary}",
                          label) if record else None
-            r = run_episode(sim, policy, term, bank[idx], args.duration,
+            r = run_episode(sim, policy, term, bank[idx], duration,
                             renderer, camera, ov)
             r |= {"posture": posture, "pose_idx": int(idx)}
             rows.append(r)
-            flag = "STOOD UP" if r["success"] else "failed"
-            print(f"  {posture:<11} #{idx:<4} {flag:<9} "
+            flag = term.banner if r["success"] else "failed"
+            print(f"  {posture:<11} #{idx:<4} {flag:<12} "
                   f"peak pelvis {r['peak_z']:.2f} m  final {r['final_z']:.2f} m  "
                   f"tilt {r['final_tilt_deg']:5.1f} deg")
             if ov:
@@ -435,7 +533,7 @@ def main() -> None:
         renderer.close()
 
     n_ok = sum(r["success"] for r in rows)
-    print(f"\n{n_ok}/{len(rows)} episodes reached and held the handoff pose")
+    print(f"\n{n_ok}/{len(rows)} episodes {term.summary}")
     by = {}
     for r in rows:
         by.setdefault(r["posture"], []).append(r["success"])
@@ -444,19 +542,20 @@ def main() -> None:
 
     out = REPO_ROOT / "results" / "getup"
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{args.name}.json").write_text(
-        json.dumps({"onnx": args.onnx, "iteration": policy.iteration,
+    (out / f"{name}.json").write_text(
+        json.dumps({"onnx": args.onnx, "task": term.name,
+                    "iteration": policy.iteration,
                     "action_map": amap, "assisted": False,
                     "episodes": rows, "success": n_ok,
                     "total": len(rows)}, indent=2), encoding="utf-8")
-    print(f"\nmetrics  {out / f'{args.name}.json'}")
+    print(f"\nmetrics  {out / f'{name}.json'}")
 
     if record and montage:
         import imageio.v2 as imageio
 
-        vid_dir = REPO_ROOT / "results" / "videos" / args.name
+        vid_dir = REPO_ROOT / "results" / "videos" / name
         vid_dir.mkdir(parents=True, exist_ok=True)
-        path = vid_dir / f"{args.name}.mp4"
+        path = vid_dir / f"{name}.mp4"
         imageio.mimsave(path, montage, fps=VIDEO_FPS, quality=8, macro_block_size=1)
         print(f"video    {path}  ({len(montage) / VIDEO_FPS:.0f} s)")
 
