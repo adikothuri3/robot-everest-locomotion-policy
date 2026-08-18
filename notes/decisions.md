@@ -1,12 +1,31 @@
 ---
 title: Decisions
-updated: 2026-08-16
+updated: 2026-08-18
 status: current
 ---
 
 # Decisions
 
 Newest first. Each entry: what was chosen, why, what was rejected. Add an entry whenever a session makes a call that a future agent might otherwise re-litigate.
+
+## 2026-08-18 — Never gate a curriculum on a metric that curriculum suppresses
+
+**The bug that wedged the v3 get-up run for 14k iterations and 1.37B samples.** The action-authority curriculum (HoST's β) started at 2.0 — double the deployable action scale — and annealed only when the assist curriculum's rose proxy cleared its threshold. But β 2.0 *by itself* makes the terminal state unholdable: measured on a standing spawn with a real policy and **zero exploration noise**, mean `max|dof_vel|` over legs+waist is **1.36 rad/s** against `SUCCESS_JOINT_VEL` 1.0, so the six-way gate passes 0.2% of steps (at β 1.0: 596 consecutive steps held, jvel 0.016). β pinned `getup_success_rate` at exactly 0, the rose proxy sat in the curriculum's dead band, so β never annealed. No exit.
+
+**Chosen:**
+- **β is scheduled, never metric-gated** — `GetupAuthorityCurriculum`, linear 2.0 → 1.0 over the first 120k env steps (~5k iterations; `common_step_counter` counts env steps, and 20k iterations × 24 = 480k). Tao 2022 and HoST both schedule the rescaler; gating it was our porting error. The schedule is **one-way** (clamped to the running minimum) because `_init_counters` resets `common_step_counter` to 0 on every construction *including a resume*, while `load_checkpoint_state` restores the annealed β — a bare schedule would shove β back to 2.0 and re-wedge any resumed run.
+- **The hold counter leaks instead of resetting.** Requiring 100 *strictly consecutive* steps of a six-way conjunction measures PPO's sampling noise, not the stand: at β 1.0 with converged noise the gate passes 95.5% of steps but never 100 in a row, because one of 15 leg/waist joints spikes past 1.0 rad/s every ~20 steps. Now `+1` per passing step, `−2` per failing one, floor 0. The stillness test also runs on a 0.05 s EMA of `|dof_vel|`. Still correctly unreachable for a thrashing policy (noise ≥ 0.3 never succeeds).
+- **`easy_start_prob` is fixed at 0.10, decoupled from `assist_scale`.** While it was `0.05 + 0.25·assist_scale`, 30% of episodes began standing and handed `rose_rate` ~0.30 of free credit — most of the distance to the threshold the curriculum was waiting on.
+- **The curriculum drives on `getup_rose_rate_fallen`** (pose-bank starts only). Both rates are logged.
+- **`GetupPenaltyCurriculum`** replaces the stock one for get-up: nothing terminates in this task by design, so `average_episode_length` is pinned at the 500-step cap from iteration 0 and the penalty ramp saturated on a signal carrying no information. Now driven by the fallen-start rise rate. Rollover keeps the stock term — its episodes do terminate.
+
+**Ruled out before landing on this,** so nobody re-checks them: actuator torque (knee 320 Nm, τ/(m·h) 3.1 vs G1's *proven* 3.0 — the A3 is better actuated per kg than the robot HoST was demonstrated on); the assist force (a standing robot holds *better* under 350 N, not worse); and gate reachability in principle (the v1 locomotion policy satisfies the handoff gate 100% of steps with 50× margin). **Reproduce any of it with `scripts/diagnostics/check_getup_terminal.py`,** which exits non-zero if the terminal state becomes unreachable again. Multi-critic remains the escalation if the fixed run plateaus (`docs/research/getup_recipes.md` pre-registered <60–70% as the trigger).
+
+## 2026-08-18 — The `actions` observation reports the *applied* action, not the policy's raw output
+
+`ActionManager.process_actions` stores `self._action[:] = actions` — the tensor `_pre_physics_step` handed it — and the `actions` observation term returns that buffer. So an env that rescales actions before calling `super()` (get-up does: β × wrist soft-freeze) also changes what the policy observes next step, and any eval harness must feed the applied action back.
+
+**Verified against the trained policy, not assumed,** because the two conventions disagree sharply and picking wrong silently makes a working policy look broken. Replayed from a standing anchor, applied feedback holds **1.061 m at 0.008 rad** of pose error — matching what the run logged (`task_target_pose` per step ≈ the easy-start share, i.e. standing envs hold the default pose). Raw feedback collapses the same policy to **0.509 m and 1.366 rad**, which the telemetry rules out. `check_getup_terminal.py` re-runs this discriminator on every invocation. `A3Sim.apply_action` therefore sits on both the torque path and the observation feedback, and is identity at its defaults so every recorded locomotion grade (68/68) is unaffected.
 
 ## 2026-08-16 — An overridden action channel must still be given a target
 

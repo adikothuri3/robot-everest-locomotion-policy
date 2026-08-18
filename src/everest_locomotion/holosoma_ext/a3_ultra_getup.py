@@ -69,6 +69,7 @@ from holosoma.config_values.loco.g1.randomization import g1_29dof_randomization 
 from holosoma.envs.locomotion.locomotion_manager import LeggedRobotLocomotionManager  # noqa: E402
 from holosoma.managers.command.base import CommandTermBase  # noqa: E402
 from holosoma.managers.curriculum.base import CurriculumTermBase  # noqa: E402
+from holosoma.managers.curriculum.terms.locomotion import PenaltyCurriculum  # noqa: E402
 from holosoma.managers.observation.terms.locomotion import (  # noqa: E402
     get_projected_gravity,
     gravity_vector,
@@ -96,7 +97,28 @@ SUCCESS_HEIGHT = 0.98
 SUCCESS_POSE_TOL = 0.30
 SUCCESS_LIN_VEL = 0.25
 SUCCESS_JOINT_VEL = 1.0
+# The stillness test runs on an EMA of |dof_vel|, not the raw instantaneous
+# value, and the hold counter leaks instead of resetting to zero. Measured
+# (scripts/diagnostics/check_getup_terminal.py, standing spawn, converged
+# policy at beta 1.0 with PPO's own action noise): the six-way gate passes
+# 95.5% of steps but NEVER 100 strictly consecutive ones, because exploration
+# noise spikes one of 15 leg/waist joints past 1.0 rad/s every ~20 steps. A
+# strict consecutive conjunction therefore measures the sampling noise, not the
+# stand. Leaky counting keeps the 2 s meaning and stays correctly unreachable
+# for a policy that is genuinely thrashing (noise 0.3+ never succeeds).
+SUCCESS_HOLD_DECAY = 2         # counter -= this on a failing step, floor 0
+JOINT_SPEED_TAU_S = 0.05       # EMA time constant for the stillness test
 MAX_ASSIST_FORCE_N = 350.0     # ~60% of 590 N weight (HoST heuristic)
+# Strong-to-weak action authority (HoST's beta). 2.0 doubles the effective
+# action scale to 0.5. THIS IS SCHEDULED, NEVER METRIC-GATED -- see
+# GetupAuthorityCurriculum for why gating it deadlocked the 2026-08-16 run.
+AUTHORITY_START = 2.0
+AUTHORITY_END = 1.0
+# Standing anchors keep the stabilize-and-hold stage in the data. Fixed, NOT
+# tied to assist_scale: while it was tied, 30% of episodes started standing and
+# padded `rose_rate` with ~0.30 of free credit, which is most of the distance
+# to the anneal threshold the curriculum was waiting on.
+EASY_START_PROB = 0.10
 WRIST_ACTION_FACTOR = 0.2      # at deploy authority 1.0: 0.25*0.2 = manifest 0.05
                                # (early training: authority 2.0 -> wrists at 0.1,
                                # annealing to the manifest cap with everything else)
@@ -129,14 +151,20 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
         # resume — curriculum state must survive it, so only initialize once
         if not hasattr(self, "getup_assist_scale"):
             self.getup_assist_scale = 1.0  # annealed by GetupAssistCurriculum
-            self.getup_action_authority = 2.0  # strong-to-weak, anneals to 1.0
+            self.getup_action_authority = AUTHORITY_START  # scheduled, see curriculum
             self._success_rate = torch.tensor(0.0, device=self.device)
             self._rose_rate = torch.tensor(0.0, device=self.device)
+            # rose measured on FALLEN starts only -- the number the assist
+            # curriculum actually anneals on, uncontaminated by easy starts
+            self._rose_rate_fallen = torch.tensor(0.0, device=self.device)
         self._assist_was_zero = False
         self._stand_hold_count = torch.zeros(n, dtype=torch.long, device=self.device)
         self._ever_success = torch.zeros(n, dtype=torch.bool, device=self.device)
         self._getup_prev_dof_vel = torch.zeros(n, self.num_dof, device=self.device)
         self.getup_dof_acc = torch.zeros(n, self.num_dof, device=self.device)
+        self._joint_speed_ema = torch.zeros(n, self.num_dof, device=self.device)
+        # set per-episode by PoseBankCommand; True = started from the pose bank
+        self._start_is_fallen = torch.ones(n, dtype=torch.bool, device=self.device)
         self._wrist_dof_idx = torch.tensor(
             [i for i, name in enumerate(self.dof_names) if "wrist" in name],
             dtype=torch.long, device=self.device,
@@ -191,18 +219,26 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
         dt = self.dt
         self.getup_dof_acc[:] = (self.simulator.dof_vel - self._getup_prev_dof_vel) / dt
         self._getup_prev_dof_vel[:] = self.simulator.dof_vel
+        alpha = dt / (JOINT_SPEED_TAU_S + dt)
+        self._joint_speed_ema += alpha * (
+            torch.abs(self.simulator.dof_vel) - self._joint_speed_ema
+        )
 
         heights = getup_base_height(self)
         pg_z = get_projected_gravity(self)[:, 2]
         lin_vel = torch.norm(self.simulator.robot_root_states[:, 7:10], dim=-1)
         ang_vel = torch.norm(self.simulator.robot_root_states[:, 10:13], dim=-1)
         success_now = self._task_success_condition(heights, pg_z, lin_vel, ang_vel)
+        # leaky, not reset-to-zero: see SUCCESS_HOLD_DECAY
         self._stand_hold_count = torch.where(
-            success_now, self._stand_hold_count + 1, torch.zeros_like(self._stand_hold_count)
+            success_now,
+            self._stand_hold_count + 1,
+            (self._stand_hold_count - SUCCESS_HOLD_DECAY).clamp(min=0),
         )
         self._ever_success |= self._stand_hold_count >= self.TASK_HOLD_STEPS
         self.log_dict["getup_success_rate"] = self._success_rate.detach().cpu()
         self.log_dict["getup_rose_rate"] = self._rose_rate.detach().cpu()
+        self.log_dict["getup_rose_rate_fallen"] = self._rose_rate_fallen.detach().cpu()
         self.log_dict["getup_assist_scale"] = torch.tensor(float(self.getup_assist_scale))
         self.log_dict["getup_action_authority"] = torch.tensor(float(self.getup_action_authority))
 
@@ -214,7 +250,9 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
         pose_err = torch.mean(
             torch.abs(self.simulator.dof_pos[:, lw] - self.default_dof_pos[:, lw]), dim=1
         )
-        joint_speed = torch.amax(torch.abs(self.simulator.dof_vel[:, lw]), dim=1)
+        # EMA, not the instantaneous max: a single exploration-noise spike on one
+        # of 15 joints must not veto an otherwise-held stand (see the constants)
+        joint_speed = torch.amax(self._joint_speed_ema[:, lw], dim=1)
         return (
             (heights > SUCCESS_HEIGHT)
             & (pg_z < UPRIGHT_GATE)
@@ -233,11 +271,21 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
             # HoST anneals on a LOOSE terminal-height proxy (head height at
             # episode end > threshold), not on strict success — so the assist
             # reaches zero early and the strict contract is learned force-free
-            rose = (getup_base_height(self)[env_ids] > 0.75).float().mean()
-            self._rose_rate = self._rose_rate * (1 - weight) + rose * weight
+            rose_flag = (getup_base_height(self)[env_ids] > 0.75).float()
+            self._rose_rate = self._rose_rate * (1 - weight) + rose_flag.mean() * weight
+            # ...but only the FALLEN starts carry information about rising.
+            # Easy starts begin above the threshold and end there, so mixing
+            # them in adds a constant floor to the metric the curriculum waits
+            # on — the 2026-08-16 run sat at rose 0.394 with ~0.30 of it free.
+            fallen = self._start_is_fallen[env_ids]
+            if bool(fallen.any()):
+                rose_f = rose_flag[fallen].mean()
+                w_f = min(float(fallen.sum()) / max(1.0, 0.25 * self.num_envs), 1.0) * 0.2
+                self._rose_rate_fallen = self._rose_rate_fallen * (1 - w_f) + rose_f * w_f
             self._ever_success[env_ids] = False
             self._stand_hold_count[env_ids] = 0
             self._getup_prev_dof_vel[env_ids] = 0.0
+            self._joint_speed_ema[env_ids] = 0.0
         super()._reset_buffers_callback(env_ids, target_buf)
 
     @property
@@ -249,14 +297,17 @@ class A3UltraGetupManager(LeggedRobotLocomotionManager):
         return float(self._rose_rate.detach().cpu().item())
 
     @property
+    def getup_rose_rate_fallen(self) -> float:
+        """Rose rate over pose-bank starts only — the curriculum's driver."""
+        return float(self._rose_rate_fallen.detach().cpu().item())
+
+    @property
     def getup_easy_start_prob(self) -> float:
         # debug override: force all-standing starts to isolate task machinery
         # from lying-pose contact physics (MJWarp NaN triage)
         if os.environ.get("EVEREST_GETUP_FORCE_EASY"):
             return 1.0
-        # more easy (standing) starts while assist is strong; floor keeps the
-        # stand-still stage in the data forever
-        return 0.05 + 0.25 * float(self.getup_assist_scale)
+        return EASY_START_PROB
 
     # -- wrist soft-freeze (manifest getup.wrist_action_scale) ---------------
     def _pre_physics_step(self, actions):
@@ -587,6 +638,9 @@ class PoseBankCommand(CommandTermBase):
         quat = torch.where(easy.unsqueeze(1), stand_quat, quat)
         root_z = torch.where(easy, torch.full_like(root_z, STAND_BASE_HEIGHT + 0.005), root_z)
 
+        # Which episodes carry information about rising (see _reset_buffers_callback)
+        env._start_is_fallen[env_ids] = ~easy
+
         env.simulator.dof_pos[env_ids] = dof_pos
         env.simulator.dof_vel[env_ids] = 0.0
         rs = env.simulator.robot_root_states
@@ -604,10 +658,100 @@ class PoseBankCommand(CommandTermBase):
 # ---------------------------------------------------------------------------
 # Curriculum term: anneal assist force by success rate
 # ---------------------------------------------------------------------------
-class GetupAssistCurriculum(CurriculumTermBase):
-    """HoST pull-force curriculum, driven by held-stand success rate.
+class GetupAuthorityCurriculum(CurriculumTermBase):
+    """Strong-to-weak action authority (HoST's beta) on a FIXED schedule.
 
-    Every `interval_resets` env-episode ends: success above `up_threshold`
+    Deliberately NOT metric-gated, and that is the whole point. beta 2.0 doubles
+    the effective action scale to 0.5, and at that scale the robot cannot hold
+    still: measured at a quiet stand with a converged policy, max |dof_vel| over
+    the leg/waist joints averages 1.36 rad/s against a SUCCESS_JOINT_VEL of 1.0,
+    so `_task_success_condition` is unsatisfiable *even with zero exploration
+    noise* (scripts/diagnostics/check_getup_terminal.py: 1/100 steps held at
+    beta 2.0 vs 496/100 at beta 1.0).
+
+    The 2026-08-16 run gated beta on the same rose-rate trigger as the assist.
+    That is a deadlock with no exit: beta pins success at 0, the rose proxy sits
+    in the curriculum's dead band, so beta never anneals, so success stays 0 --
+    for 14k iterations and 1.37B samples. Tao 2022 and HoST both schedule the
+    rescaler rather than gating it; this restores that.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        p = cfg.params or {}
+        self.start = float(p.get("start", AUTHORITY_START))
+        self.end = float(p.get("end", AUTHORITY_END))
+        # in ENV steps: iterations x num_steps_per_env (24 for this PPO config)
+        self.anneal_steps = int(p.get("anneal_steps", 120_000))
+
+    def _apply(self) -> None:
+        # Idempotent: a pure function of the step counter, so it is safe to call
+        # from whichever hooks the CurriculumManager drives.
+        frac = min(1.0, float(self.env.common_step_counter) / max(1, self.anneal_steps))
+        scheduled = self.start + (self.end - self.start) * frac
+        # ONE-WAY. `common_step_counter` is re-initialised to 0 by
+        # `_init_counters` on every construction, including a resume, while
+        # `load_checkpoint_state` restores the annealed beta — so a bare
+        # schedule would shove beta back to `start` on resume and re-wedge the
+        # run (E13 resumed mid-training; this would have hit it). Clamping to
+        # the running minimum makes resume safe and matches strong-to-weak
+        # semantics: authority never increases.
+        self.env.getup_action_authority = min(
+            float(self.env.getup_action_authority), scheduled
+        )
+
+    def setup(self) -> None:
+        self._apply()
+
+    def reset(self, env_ids) -> None:
+        self._apply()
+
+    def step(self) -> None:
+        self._apply()
+
+
+class GetupPenaltyCurriculum(PenaltyCurriculum):
+    """PenaltyCurriculum driven by rising progress instead of episode length.
+
+    The base class levels up whenever `average_episode_length` clears its
+    threshold. In this task nothing terminates -- no contact termination by
+    design, and `stuck_low` deliberately spares anything that has sat up -- so
+    average episode length is pinned at the 500-step cap from iteration ~0 and
+    the ramp saturates at 1.0 immediately, on a signal that says nothing about
+    motion quality. Drive it on the fallen-start rose rate, which is what
+    "the robot is actually getting up" looks like here.
+    """
+
+    def reset(self, env_ids) -> None:
+        rate = float(self.env.getup_rose_rate_fallen)
+        # Reuse the base class's machinery by handing it a comparable scalar:
+        # thresholds are expressed as rose rates in [0, 1] by the config.
+        if not self.enabled or not self.penalty_reward_names:
+            return super().reset(env_ids)
+        if rate < self.level_down_threshold:
+            self.current_scale *= 1.0 - self.degree
+        elif rate > self.level_up_threshold:
+            self.current_scale *= 1.0 + self.degree
+        self.current_scale = min(self.max_scale, max(self.min_scale, self.current_scale))
+        for name in self.penalty_reward_names:
+            if name not in self.original_weights:
+                continue
+            if name not in self.env.reward_manager.active_terms:
+                continue
+            term_cfg = self.env.reward_manager.get_term_cfg(name)
+            self.env.reward_manager.set_term_cfg(
+                name, replace(term_cfg, weight=self.original_weights[name] * self.current_scale)
+            )
+        self.env.reward_penalty_scale = self.current_scale
+        self.env.log_dict["penalty_scale"] = torch.tensor(
+            self.current_scale, dtype=torch.float
+        )
+
+
+class GetupAssistCurriculum(CurriculumTermBase):
+    """HoST pull-force curriculum, driven by the fallen-start rise rate.
+
+    Every `interval_resets` env-episode ends: a rise rate above `up_threshold`
     lowers the assist scale by `step`; below `down_threshold` raises it.
     """
 
@@ -635,18 +779,18 @@ class GetupAssistCurriculum(CurriculumTermBase):
         self._resets_seen = 0
         # anneal on the LOOSE rose proxy (HoST's terminal-height trigger), so
         # the assist reaches zero early and the strict handoff contract is
-        # learned force-free; strict success stays the reported metric
-        rate = self.env.getup_rose_rate
+        # learned force-free; strict success stays the reported metric.
+        # FALLEN starts only -- easy starts are already above the threshold and
+        # only add a constant offset to the trigger.
+        rate = self.env.getup_rose_rate_fallen
         scale = float(self.env.getup_assist_scale)
         if rate > self.up_threshold:
             scale -= self.step_size
-            # strong-to-weak action authority anneals on the same trigger
-            # (HoST beta analog), one-way, floor 1.0 (= deploy scale 0.25)
-            self.env.getup_action_authority = max(
-                1.0, float(self.env.getup_action_authority) - 0.1
-            )
         elif rate < self.down_threshold:
             scale += self.step_size
+        # Action authority is NOT touched here: it is scheduled by
+        # GetupAuthorityCurriculum. Gating it on this trigger deadlocked the
+        # 2026-08-16 run — see that class for the measurement.
         self.env.getup_assist_scale = min(self.max_scale, max(self.min_scale, scale))
 
     def step(self) -> None:
@@ -994,16 +1138,18 @@ getup_curriculum = CurriculumManagerCfg(
         # episodes end early only on velocity blowups, so average episode
         # length is a smoothness proxy: ramp penalties in as flailing stops
         # (max episode = 10 s @ 50 Hz = 500 steps)
+        # thresholds are FALLEN-start rose rates in [0, 1], not step counts —
+        # see GetupPenaltyCurriculum for why episode length is uninformative here
         "penalty_curriculum": CurriculumTermCfg(
-            func="holosoma.managers.curriculum.terms.locomotion:PenaltyCurriculum",
+            func="everest_getup:GetupPenaltyCurriculum",
             params={
                 "enabled": True,
                 "tag": "penalty_curriculum",
                 "initial_scale": 0.1,
                 "min_scale": 0.1,
                 "max_scale": 1.0,
-                "level_down_threshold": 150.0,
-                "level_up_threshold": 400.0,
+                "level_down_threshold": 0.15,
+                "level_up_threshold": 0.40,
                 "degree": 0.001,
             },
         ),
@@ -1017,6 +1163,14 @@ getup_curriculum = CurriculumManagerCfg(
                 "max_scale": 1.0,
                 "interval_resets": 4096,
             },
+        ),
+        # scheduled, never metric-gated (the 2026-08-16 deadlock). 120k env
+        # steps = 5000 PPO iterations at num_steps_per_env 24, i.e. beta reaches
+        # its deploy value 1.0 in the first quarter of a 20k-iteration run.
+        "getup_authority": CurriculumTermCfg(
+            func="everest_getup:GetupAuthorityCurriculum",
+            params={"start": AUTHORITY_START, "end": AUTHORITY_END,
+                    "anneal_steps": 120_000},
         ),
     },
     reset_terms={},

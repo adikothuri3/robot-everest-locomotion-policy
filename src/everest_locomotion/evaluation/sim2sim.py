@@ -527,6 +527,16 @@ class A3Sim:
 
         self.phase_dt = 2.0 * math.pi * self.control_dt / self.layout.gait_period
         self.arm_idx = np.asarray(self.layout.arm_dof_indices, dtype=int)
+        # Action-pipeline knobs, identity for locomotion. The get-up env scales
+        # every action by its authority curriculum (HoST's beta) and soft-freezes
+        # the wrists before handing the action to the action manager, so a get-up
+        # policy has to be graded through the same map it was trained through --
+        # see A3UltraGetupManager._pre_physics_step.
+        self.action_authority = 1.0
+        self.wrist_action_factor = 1.0
+        self._wrist_idx = np.asarray(
+            [i for i, n in enumerate(policy.dof_names) if "wrist" in n], dtype=int
+        )
         self._scan_grid = self._build_scan_grid()
         self._obs_history: dict[str, list[np.ndarray]] = {}
 
@@ -683,6 +693,11 @@ class A3Sim:
             return np.cos(self.phase(step, cmd))
         if name == "heading_error":
             return np.array([heading_err])
+        if name == "action_authority":
+            # HoST puts beta in s_t so the policy can condition on its own action
+            # scale. It is runtime curriculum state, not config: whatever value
+            # the rollout applies is the value the policy must be told about.
+            return np.array([self.action_authority])
         if name == "upper_body_target":
             return arm_target_rel
         if name == "height_scan":
@@ -726,6 +741,36 @@ class A3Sim:
                 [np.zeros(pad * term.dim), *buf] if pad else buf
             )
         return obs
+
+    def apply_action(self, action: np.ndarray) -> np.ndarray:
+        """Policy output -> the action that actually reaches the joints.
+
+        The get-up env rescales actions in ``_pre_physics_step`` (authority beta,
+        wrist soft-freeze) before they become PD targets, so a harness that skips
+        that map commands the wrong joint travel. Identity while both knobs are
+        at their defaults, so this is behaviour-neutral for locomotion policies.
+
+        **This also feeds the observation.** ``ActionManager.process_actions``
+        stores ``self._action[:] = actions`` -- the tensor ``_pre_physics_step``
+        handed it, i.e. the *rescaled* one -- and the ``actions`` observation
+        term returns that buffer. So an env that rescales before calling
+        ``super()`` changes what the policy observes next step, and the harness
+        must feed the applied action back.
+
+        Verified against the trained policy rather than assumed, because the two
+        conventions disagree sharply: replayed from a standing anchor, applied
+        feedback holds 1.061 m at 0.008 rad of pose error, matching what the run
+        actually logged (``task_target_pose`` per step ~= the easy-start share,
+        i.e. standing envs hold the default pose). Raw feedback collapses the
+        same policy to 0.509 m and 1.366 rad, which the training telemetry rules
+        out. ``scripts/diagnostics/check_getup_terminal.py`` re-checks this.
+        """
+        if self.action_authority == 1.0 and self.wrist_action_factor == 1.0:
+            return action
+        applied = action * self.action_authority
+        if self._wrist_idx.size:
+            applied[self._wrist_idx] *= self.wrist_action_factor
+        return applied
 
     def arm_target_rel(self, prev_action: np.ndarray, t: float, target_override) -> np.ndarray:
         """Arm joint target relative to the default pose, as v2 observes it.
@@ -781,6 +826,7 @@ class A3Sim:
                 )
 
         prev_action = np.zeros(self.policy.n_dof)
+        prev_applied = np.zeros(self.policy.n_dof)
         push_i = 0
         heights, tilts, torques, jitter = [], [], [], []
         sat, lim_frac, slip = [], [], 0.0
@@ -802,15 +848,18 @@ class A3Sim:
                 step,
                 cmd,
                 heading_err=heading_err,
-                arm_target_rel=self.arm_target_rel(prev_action, t, target_override),
+                # the arm target that was actually applied, not the raw request
+                arm_target_rel=self.arm_target_rel(prev_applied, t, target_override),
             )
             if obs_transform is not None:
                 obs = obs_transform(obs)
             if obs_noise > 0.0:
                 obs = obs + rng.uniform(-obs_noise, obs_noise, obs.shape)
-            action = self.policy.act(obs)
+            # the applied action is both what reaches the joints and what the
+            # `actions` observation reports back — see apply_action
+            action = self.apply_action(self.policy.act(obs))
             jitter.append(float(np.abs(action - prev_action).mean()))
-            prev_action = action
+            prev_action = prev_applied = action
 
             target = self.policy.default_dof_pos + self.policy.action_scale * np.clip(
                 action, -ACTION_CLIP_VALUE, ACTION_CLIP_VALUE

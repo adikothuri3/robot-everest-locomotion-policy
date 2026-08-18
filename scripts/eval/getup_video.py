@@ -2,18 +2,31 @@
 
 The locomotion suite (`sim2sim_suite.py`) cannot grade get-up: every scenario it
 owns spawns the robot standing and drives it with velocity commands, and the
-get-up actor has neither command nor gait-phase observations (93 dims, not 100).
-This script is the get-up equivalent — same MuJoCo physics, same PD/action
-contract, but episodes start from a real fallen pose in
-`assets/a3_ultra/getup/` and success is the manifest's `getup.terminal` gate.
+get-up actor has neither command nor gait-phase observations. This script is the
+get-up equivalent — same MuJoCo physics, same PD/action contract, but episodes
+start from a real fallen pose in `assets/a3_ultra/getup/` and success is the
+manifest's `getup.terminal` gate.
 
     python scripts/eval/getup_video.py --onnx checkpoints/v1_getup_28k_plateau/model_27999.onnx
     python scripts/eval/getup_video.py --onnx <ckpt> --postures supine --episodes 8
+    python scripts/eval/getup_video.py --onnx <ckpt> --action-authority 1.0   # deploy scale
 
 Success requires *holding* the handoff pose (the locomotion policy's expected
 initial state) for `hold_time_s`, not merely passing through it — a robot that
 lurches upright and topples is a failure, which is the distinction that matters
 when reading a get-up video.
+
+**The action map is not in the ONNX.** `A3UltraGetupManager._pre_physics_step`
+multiplies every action by `getup_action_authority` (2.0 early, annealing to the
+deployable 1.0) and the wrists by `getup.wrist_action_scale / action_scale`
+before the action manager ever sees it. That factor is runtime curriculum state,
+so it lives in the `.pt` and not in the config the ONNX embeds — replaying a
+checkpoint at authority 1.0 when it was trained at 2.0 commands **half** the
+joint displacement it learned to produce, which reads as "rises to a kneel and
+stalls" no matter how good the policy is. This script therefore defaults to the
+authority the checkpoint was trained at and prints where that number came from.
+Pass `--action-authority 1.0` to ask the separate question of whether the policy
+is deployable at the manifest's action scale.
 """
 
 from __future__ import annotations
@@ -80,6 +93,87 @@ class GetupSim(A3Sim):
 
 
 # ---------------------------------------------------------------------------
+# the action map the checkpoint was trained under
+
+
+def training_curriculum_state(onnx_path: Path) -> dict:
+    """Read the get-up curriculum state the run saved next to the ONNX.
+
+    `A3UltraGetupManager.get_checkpoint_state` writes `getup_action_authority`
+    and `getup_assist_scale` into the `.pt`; the ONNX export carries the
+    experiment *config* but not this, because it is state the curriculum
+    advanced at runtime. The `.pt` is the only in-repo record of the action map
+    a given checkpoint was trained under, so read it when we can. Best effort:
+    the eval venv has no torch, and grading must still work there.
+    """
+    pt = onnx_path.with_suffix(".pt")
+    if not pt.exists():
+        return {}
+    try:
+        import torch
+    except ImportError:
+        return {}
+    wanted = ("getup_action_authority", "getup_assist_scale")
+    found: dict[str, float] = {}
+
+    def walk(node) -> None:
+        if not isinstance(node, dict):
+            return
+        for key, value in node.items():
+            if key in wanted:
+                try:
+                    found[key] = float(value)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                walk(value)
+
+    walk(torch.load(pt, map_location="cpu", weights_only=False))
+    return found
+
+
+def resolve_action_map(policy: HolosomaPolicy, manifest, override: float | None) -> dict:
+    """Decide the authority / wrist factor this rollout replays, and say why."""
+    trained = training_curriculum_state(policy.path)
+    if override is not None:
+        authority, source = override, "--action-authority"
+    elif "getup_action_authority" in trained:
+        authority = trained["getup_action_authority"]
+        source = f"{policy.path.with_suffix('.pt').name} (as trained)"
+    elif policy.layout.has("action_authority"):
+        # The policy observes beta, so the curriculum existed in the run that
+        # produced it and its value is load-bearing. Guessing here is what makes
+        # a working policy look broken -- refuse instead.
+        raise SystemExit(
+            f"{policy.path.name} observes `action_authority`, so it was trained under the\n"
+            "authority curriculum, but the value is not recoverable: no readable\n"
+            f"{policy.path.with_suffix('.pt').name} beside it (needs torch on the path).\n"
+            "Pass --action-authority explicitly — read Env/getup_action_authority off the\n"
+            "run's TensorBoard, or 1.0 to grade deployability at the manifest action scale."
+        )
+    else:
+        # Pre-v3 checkpoint: no authority curriculum existed, actions went
+        # through unscaled.
+        authority, source = 1.0, "1.0 (checkpoint predates the authority curriculum)"
+
+    # Wrist soft-freeze is config, not curriculum: derive it rather than
+    # duplicating WRIST_ACTION_FACTOR from the training extension.
+    wrist_idx = [i for i, n in enumerate(policy.dof_names) if "wrist" in n]
+    wrist_factor = 1.0
+    if wrist_idx:
+        wrist_factor = float(
+            manifest.raw["getup"]["wrist_action_scale"]
+            / np.mean(policy.action_scale[wrist_idx])
+        )
+    return {
+        "action_authority": float(authority),
+        "authority_source": source,
+        "wrist_action_factor": wrist_factor,
+        "trained_assist_scale": trained.get("getup_assist_scale"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # success gate
 
 
@@ -111,7 +205,10 @@ class Terminal:
             np.abs(q[self.pose_idx] - self.default[self.pose_idx]).mean()
         )
         lin = float(np.linalg.norm(sim.data.qvel[0:3]))
-        jv = float(np.abs(qd).max())
+        # legs+waist, matching `_task_success_condition` in the training env and
+        # the manifest's "mean over legs+waist" scope. Over all 29 joints an arm
+        # still settling fails the gate on a stance the handoff contract accepts.
+        jv = float(np.abs(qd[self.pose_idx]).max())
         ok = (
             abs(z - self.height) <= self.height_tol
             and pose_err <= self.pose_tol
@@ -206,7 +303,10 @@ def run_episode(sim: GetupSim, policy: HolosomaPolicy, term: Terminal, qpos: np.
     for step in range(n):
         t = step * dt
         obs = sim.observe(prev_action, step, cmd)
-        action = policy.act(obs)
+        # Through the env's own action map (authority x wrist freeze). The
+        # applied action is also what feeds back into the `actions` observation
+        # — see A3Sim.apply_action for how that was verified.
+        action = sim.apply_action(policy.act(obs))
         prev_action = action
 
         target = policy.default_dof_pos + policy.action_scale * np.clip(
@@ -262,18 +362,34 @@ def main() -> None:
     p.add_argument("--name", default="getup")
     p.add_argument("--no-video", action="store_true")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--action-authority", type=float, default=None,
+                   help="replay actions at this authority (beta). Default: the value "
+                        "the checkpoint was trained at, read from its .pt. Pass 1.0 to "
+                        "grade deployability at the manifest action scale.")
     args = p.parse_args()
 
     manifest = load_manifest()
     policy = HolosomaPolicy(args.onnx)
     term = Terminal(manifest, policy)
+    amap = resolve_action_map(policy, manifest, args.action_authority)
     label = f"iter {policy.iteration}" if policy.iteration >= 0 else Path(args.onnx).stem
+    label += f" · beta {amap['action_authority']:.2f} · unassisted"
     record = not args.no_video
     rng = np.random.default_rng(args.seed)
 
     print(f"policy   {args.onnx}")
     print(f"obs      {policy.obs_dim} dims  (layout: {policy.layout.source})")
     print(f"terms    {', '.join(t.name for t in policy.layout.terms)}")
+    print(f"action   authority {amap['action_authority']:.2f} "
+          f"[{amap['authority_source']}], wrists x{amap['wrist_action_factor']:.2f} "
+          f"-> effective scale {policy.action_scale.mean() * amap['action_authority']:.3f}")
+    if amap["action_authority"] != 1.0:
+        print("         NOT the deploy scale — this grades the policy in distribution, "
+              "not its deployability")
+    if amap["trained_assist_scale"]:
+        print(f"assist   trained with assist_scale {amap['trained_assist_scale']:.2f} "
+              f"({amap['trained_assist_scale'] * 350:.0f} N torso pull); "
+              "this rollout is UNASSISTED")
     print(f"gate     hold {term.hold_time:.0f}s at {term.height:.2f} +/- {term.height_tol:.2f} m, "
           f"pose <= {term.pose_tol} rad, |v| <= {term.lin_vel_max} m/s\n")
 
@@ -281,6 +397,8 @@ def main() -> None:
     if record:
         model.vis.global_.offwidth, model.vis.global_.offheight = VIDEO_W, VIDEO_H
     sim = GetupSim(policy, manifest, model=model)
+    sim.action_authority = amap["action_authority"]
+    sim.wrist_action_factor = amap["wrist_action_factor"]
 
     renderer = camera = None
     if record:
@@ -327,7 +445,9 @@ def main() -> None:
     out = REPO_ROOT / "results" / "getup"
     out.mkdir(parents=True, exist_ok=True)
     (out / f"{args.name}.json").write_text(
-        json.dumps({"onnx": args.onnx, "episodes": rows, "success": n_ok,
+        json.dumps({"onnx": args.onnx, "iteration": policy.iteration,
+                    "action_map": amap, "assisted": False,
+                    "episodes": rows, "success": n_ok,
                     "total": len(rows)}, indent=2), encoding="utf-8")
     print(f"\nmetrics  {out / f'{args.name}.json'}")
 

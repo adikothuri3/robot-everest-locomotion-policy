@@ -41,19 +41,40 @@
 # Watch during training (TensorBoard: logs/everest-a3/<run>/; env log_dict
 # tags are logged WITHOUT a prefix):
 #   getup_success_rate     -> target >0.95 for rollover (settled-on-back gate),
-#                             >0.9 for getup (manifest handoff-pose gate)
-#   getup_assist_scale, getup_rose_rate -> GETUP RUN ONLY (rollover has no
-#                             assist force: its assist_scale logs 1.0 and
-#                             rose_rate ~0 forever — that is normal)
-#   getup_action_authority -> getup run: must anneal 2.0 -> 1.0
-#   penalty_scale          -> smoothness ramp (0.1 -> 1.0), both runs
-#   average_episode_length -> rollover ~250 max (5 s), getup ~500 max (10 s);
-#                             getup runs BELOW max early by design (stuck-low
-#                             recycling) and approaches it as rising works.
+#                             >0.9 for getup (manifest handoff-pose gate).
+#                             GETUP: stays 0 until getup_action_authority has
+#                             annealed to ~1.0 — that is expected, not a stall
+#                             (beta 2.0 doubles the action scale and the robot
+#                             physically cannot hold the terminal pose at it).
+#   getup_action_authority -> getup run: SCHEDULED 2.0 -> 1.0 over the first
+#                             120k env steps (~5k iterations). It is no longer
+#                             metric-gated. If it is not falling, the curriculum
+#                             term is not running: abort immediately.
+#   getup_rose_rate_fallen -> THE curriculum driver: rise rate over pose-bank
+#                             starts only. getup_rose_rate (all starts) is
+#                             logged too but is padded by the standing anchors.
+#   getup_assist_scale     -> GETUP RUN ONLY, annealed by rose_rate_fallen
+#                             (rollover has no assist: its assist_scale logs
+#                             1.0 and rose_rate ~0 forever — that is normal)
+#   penalty_scale          -> smoothness ramp (0.1 -> 1.0). GETUP: now driven by
+#                             rose_rate_fallen, not episode length.
+#   average_episode_length -> rollover ~250 max (5 s), getup ~500 max (10 s).
 #                             Pinned at ~10-30 = dying at spawn: abort.
+#
+# ABORT RULES (the 2026-08-16 run burned 14k iterations / 1.37B samples wedged;
+# every one of these would have caught it inside the first hour):
+#   * getup_action_authority still 2.0 after 6k iterations  -> abort
+#   * getup_assist_scale still 1.00 after 8k iterations      -> abort
+#   * getup_rose_rate_fallen flat for 4k iterations          -> abort
+#   * getup_success_rate still 0 after authority reaches 1.0
+#     AND rose_rate_fallen > 0.5                             -> abort
+#
 # DONE, rollover: success_rate > 0.95 AND penalty_scale == 1.0.
 # DONE, getup:    success_rate > 0.9 AND assist_scale == 0.0 AND
 #                 authority == 1.0 AND penalty_scale == 1.0.
+#
+# Before spending cloud hours, run locally:
+#   python scripts/diagnostics/check_getup_terminal.py   (must exit 0)
 # =============================================================================
 set -euo pipefail
 
