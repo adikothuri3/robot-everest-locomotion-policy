@@ -121,6 +121,11 @@ class ObsLayout:
     gait_period: float = GAIT_PERIOD
     command_dim: int = 3
     scandots: dict | None = None
+    #: `{"gain": k, "clip": w}` — the heading regulator the policy was TRAINED
+    #: with. Grading a policy through a different gain measures the harness's
+    #: controller, not the policy, so scenarios inherit these unless they set
+    #: their own. Absent for v1 (no heading regulation at all).
+    heading: dict | None = None
     arm_dof_indices: list[int] = field(default_factory=list)
     source: str = "v1-default"
 
@@ -251,6 +256,7 @@ class ObsLayout:
             gait_period=float(payload.get("gait_period", GAIT_PERIOD)),
             command_dim=int(payload.get("command_dim", 3)),
             scandots=payload.get("scandots"),
+            heading=payload.get("heading"),
             arm_dof_indices=list(
                 payload.get("arm_dof_indices", range(n_dof - 14, n_dof))
             ),

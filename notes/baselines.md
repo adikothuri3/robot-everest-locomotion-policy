@@ -76,6 +76,27 @@ S1 clears `alpine_combo`, which v1 never has; its remaining failures are `fricti
 estimator, 5-frame observation history and scandots over v1, and widens the command
 envelope to +1.5 m/s.
 
+### Yaw drift — the floor T1 has to beat
+
+Measured for the first time on 2026-08-18 ([[experiments]] E09d); `heading_drift_deg` had
+been computed since the first sim2sim run and surfaced nowhere. **Clean walking is already
+good; the drift is entirely in the intense cases** — which is what makes it a tracking
+problem rather than a stability one.
+
+| scenario | S1 deg/s | | scenario | S1 deg/s |
+| --- | --- | --- | --- | --- |
+| `flat_stand` | 0.06 | | `push_right_1.5` | **−9.9** |
+| `flat_walk_fwd_0.5` | −0.41 | | `slope_up_10deg` | **+7.2** |
+| `flat_walk_fwd_1.0` | 0.70 | | `friction_mu0.1` | **+15.3** |
+| `rough_d0.5` | −1.48 | | `flat_turn_in_place_1.0` | **−31.7** |
+
+`flat_turn_in_place_1.0` is the one to read twice: against a commanded 57.3 deg/s it sheds
+31.7, so **S1 turns at ~45% of the rate it is told to**. The new heading-regulated
+`tracking` group (10 scenarios, `--only tracking`) is harsher still — S1 drifts **−15.1**
+deg/s on `hold_line_push_right` *with* the loop closed, and undertracks `hold_line_1.5` by
+27% (0.368 lin-vel error). Those ten scenarios are the gate for T1; targets in
+[[decisions]] 2026-08-18.
+
 > [!warning] Angular tracking is still the weak axis on the *reward*
 > `rew_tracking_ang_vel` finished at **0.538** for S1 against the 0.8 threshold its own
 > config declares — no better than v1's 0.559, even though the heading command was added

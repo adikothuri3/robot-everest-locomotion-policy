@@ -59,6 +59,7 @@ GROUP_BLURB = {
     "push": "external shoves while walking",
     "payload": "added payload mass",
     "alpine": "everything at once — where it breaks",
+    "tracking": "heading held — does it go where it is pointed",
 }
 
 
@@ -106,12 +107,25 @@ def rough(
     )
 
 
+def _drift_dps(result) -> float:
+    """Uncommanded yaw drift, deg/s — the number the tracking gate is written on.
+
+    `RolloutResult.heading_drift_deg` is the unwrapped yaw actually travelled minus
+    the yaw the command asked for, so dividing by the surviving duration gives a
+    rate that is comparable across scenarios of different lengths. It was computed
+    from the first sim2sim run onward and never reported anywhere, which is why the
+    policy's worst axis went unmeasured while `rew_tracking_ang_vel` — an exp() of
+    a squared error, saturated long before the error is small — stood in for it.
+    """
+    return result.heading_drift_deg / max(result.duration_s, 1e-9)
+
+
 #: Scenarios that make the montage cut — one per capability, plus the failures.
 HIGHLIGHTS = {
     "flat_command_sequence", "flat_walk_fwd_1.0", "flat_turn_in_place_1.0",
     "flat_strafe_left_0.5", "rough_d1", "slope_up_10deg", "slope_down_15deg",
     "friction_mu0.2", "push_front_2", "push_right_2", "payload_10kg",
-    "alpine_combo",
+    "alpine_combo", "hold_line_1.0", "hold_line_push_right",
 }
 
 
@@ -219,6 +233,63 @@ def showcase_scenarios() -> list[Scenario]:
             caption="alpine proxy: 12° descent on rough d0.8 + mu 0.4 + gust",
         ),
     ]
+    # --- heading-regulated straight lines -----------------------------------
+    # Until this group existed, ZERO of the 31 showcase scenarios set `heading`,
+    # so every grid, showcase and video graded a v2 policy in the pure yaw-rate
+    # mode it trains on ~16% of the time, with `heading_error` pinned at 0. The
+    # feature S1 was built around was never once exercised by its own gate.
+    #
+    # These are the "goes where you point it" cases: hold one line for 12 s while
+    # something tries to push you off it. Judge them on `yaw_drift_dps` and
+    # `lin_vel_error`, not on survival — a policy can survive all of them while
+    # walking a visible curve.
+    s += [
+        Scenario(
+            "hold_line_0.5", "tracking", 12.0, Command(lin_vel_x=0.5, heading=0.0),
+            caption="hold heading, forward 0.5 m/s",
+        ),
+        Scenario(
+            "hold_line_1.0", "tracking", 12.0, Command(lin_vel_x=1.0, heading=0.0),
+            caption="hold heading, forward 1.0 m/s",
+        ),
+        Scenario(
+            "hold_line_1.5", "tracking", 12.0, Command(lin_vel_x=1.5, heading=0.0),
+            caption="hold heading, forward 1.5 m/s (S1's widened envelope)",
+        ),
+        Scenario(
+            "hold_line_rough", "tracking", 12.0, Command(lin_vel_x=0.8, heading=0.0),
+            terrain=rough(0.75), caption="hold heading on rough d0.75",
+        ),
+        Scenario(
+            "hold_line_push_right", "tracking", 12.0,
+            Command(lin_vel_x=0.8, heading=0.0),
+            pushes=[Push(3.0, (0.0, -1.5, 0.0)), Push(7.0, (0.0, -1.5, 0.0))],
+            caption="hold heading through two right shoves — S1's worst drift case",
+        ),
+        Scenario(
+            "hold_line_push_left", "tracking", 12.0,
+            Command(lin_vel_x=0.8, heading=0.0),
+            pushes=[Push(3.0, (0.0, 1.5, 0.0)), Push(7.0, (0.0, 1.5, 0.0))],
+            caption="hold heading through two left shoves (the mirror — S1 is 2.5x better on this side)",
+        ),
+        Scenario(
+            "hold_line_mu0.2", "tracking", 12.0, Command(lin_vel_x=0.5, heading=0.0),
+            friction=0.2, caption="hold heading on mu 0.2",
+        ),
+        Scenario(
+            "hold_line_slope_up", "tracking", 12.0, Command(lin_vel_x=0.5, heading=0.0),
+            terrain=rough(0.0, slope_deg=10.0), caption="hold heading up a 10° grade",
+        ),
+        Scenario(
+            "turn_to_heading_90", "tracking", 12.0, Command(lin_vel_x=0.3, heading=np.pi / 2),
+            caption="acquire a 90° heading and hold it",
+        ),
+        Scenario(
+            "turn_to_heading_180", "tracking", 14.0, Command(lin_vel_x=0.3, heading=np.pi),
+            caption="acquire a 180° heading and hold it",
+        ),
+    ]
+
     for sc in s:
         sc.highlight = sc.name in HIGHLIGHTS
     return s
@@ -376,6 +447,15 @@ def title_card(text: str, subtitle: str = "", n_frames: int = 24) -> list[np.nda
 
 def run_scenario(policy, manifest, sc: Scenario, record: bool, policy_label: str,
                  seed: int = 0):
+    # Grade heading-regulated scenarios through the regulator the policy was
+    # trained with, not the harness default — the gain lives in the ONNX layout
+    # alongside the control period for exactly this reason. `Command` is a shared
+    # dataclass instance across sweep checkpoints, so this is idempotent.
+    layout_heading = getattr(getattr(policy, "layout", None), "heading", None)
+    if layout_heading and sc.command.heading is not None:
+        sc.command.heading_gain = float(layout_heading.get("gain", sc.command.heading_gain))
+        sc.command.heading_clip = float(layout_heading.get("clip", sc.command.heading_clip))
+
     patch = procedural_rough(sc.terrain) if sc.terrain is not None else None
     model = build_model(patch)
     if record:
@@ -498,9 +578,13 @@ def mode_showcase(args, manifest) -> None:
         # when a single case actually needs to be inspected on its own.
         want_frames = bool(args.video) and (sc.highlight or args.per_scenario_videos)
         result, frames = run_scenario(policy, manifest, sc, want_frames, label)
-        rows.append({"group": sc.group, "caption": sc.caption, **result.as_row()})
+        rows.append({
+            "group": sc.group, "caption": sc.caption,
+            "yaw_drift_dps": _drift_dps(result), **result.as_row(),
+        })
         status = "OK  " if result.survived else "FALL"
         print(f"[{status}] {sc.name:26s} velerr={result.lin_vel_error:6.3f} "
+              f"angerr={result.ang_vel_error:6.3f} drift={_drift_dps(result):7.2f}/s "
               f"speed={result.mean_speed_ms:5.2f} tilt={result.max_tilt_deg:5.1f} "
               f"h={result.mean_base_height:.2f} jit={result.action_jitter:.3f} "
               f"({time.time() - t0:4.1f}s)")
@@ -535,6 +619,9 @@ def mode_showcase(args, manifest) -> None:
             "mean_lin_vel_error": float(np.mean(track)) if track else None,
             "mean_action_jitter": float(np.mean([r["action_jitter"] for r in gr])),
             "max_tilt_deg": float(np.max([r["max_tilt_deg"] for r in gr])),
+            "max_abs_yaw_drift_dps": float(
+                np.max([abs(r["yaw_drift_dps"]) for r in gr])
+            ),
         }
 
     out = REPO / "results" / "sim2sim" / f"{args.name}.json"

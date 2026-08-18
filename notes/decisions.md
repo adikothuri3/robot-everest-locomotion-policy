@@ -8,6 +8,91 @@ status: current
 
 Newest first. Each entry: what was chosen, why, what was rejected. Add an entry whenever a session makes a call that a future agent might otherwise re-litigate.
 
+## 2026-08-18 — Yaw tracking is a reward-shape bug, not a heading-observation bug (T1)
+
+**Chosen:** branch **T1** off the promoted S1 — same 692/707 observation contract, resumed by
+`--training.checkpoint`, 40k additional iterations — carrying five changes and nothing else:
+`free_yaw_chain`, `tracking_precision`, `wide_friction`, `wide_push`, `hold_prob`. Run it with
+`RESUME_FROM=<S1 model_*.pt> bash scripts/cloud/train_a3_v2_cloud.sh t1`.
+
+**What the measurement showed.** `RolloutResult.heading_drift_deg` had been computed since the
+first sim2sim run and reported *nowhere* — not printed, not summarised, not gated. Reading it out
+of the stored S1 rows (`results/sim2sim/v2b-s1.json`) inverts the picture we had:
+
+| clean | deg/s | | disturbed | deg/s |
+| --- | --- | --- | --- | --- |
+| `flat_stand` | 0.06 | | `push_right_1.5` | **−9.9** |
+| `flat_walk_fwd_0.5` | −0.41 | | `slope_up_10deg` | **+7.2** |
+| `flat_walk_fwd_1.0` | 0.70 | | `friction_mu0.1` | **+15.3** |
+| `rough_d0.5` | −1.48 | | `flat_turn_in_place_1.0` | **−31.7** |
+
+Straight-line flat walking is already near-perfect. The drift is entirely in the intense cases,
+and `flat_turn_in_place_1.0` is the tell: against a commanded 57.3 deg/s it sheds 31.7, i.e.
+**the policy turns at ~45% of the rate it is told to**.
+
+**Root cause: `pose`.** Mapping the preset's `pose_weights` onto the canonical joint order, every
+joint that produces yaw is pinned and every joint that produces forward walking is free —
+`hip_yaw` **5.0**, `waist_yaw` **50.0** (as hard as the arms) against `hip_pitch` / `knee`
+**0.01**. At weight −0.5 with the penalty curriculum fully ramped, a turn is ~500x more expensive
+than going straight. A disturbance yaw is then doubly bad: the correction it needs *is* the motion
+it is most penalised for. `free_yaw_chain` drops both to 1.0 and leaves `waist_roll`/`waist_pitch`
+at 50.0 (torso upright is genuinely wanted) and the arms untouched (S1's 28/28 masked arm contract
+depends on them).
+
+**Why the heading command did not already fix it.** Two independent reasons, both measured:
+
+1. **The gate never exercised it.** Zero of the 31 showcase scenarios set `heading`, so every
+   grid, showcase and video graded S1 in the pure yaw-rate mode it trains on ~16% of the time,
+   with `heading_error` pinned at 0. The new `tracking` group (10 scenarios) closes this.
+2. **Closing the loop makes it *worse*, not better.** Graded with regulation on, S1 drifts
+   **−15.1 deg/s** on `hold_line_push_right` against −9.9 without it, and −16.8 on
+   `turn_to_heading_180`. The outer loop correctly asks for a correction the policy cannot
+   deliver. That is direct evidence the deficit is actuation-side, which is what makes
+   `free_yaw_chain` the primary fix rather than more heading machinery.
+
+**Rejected:** raising `tracking_ang_vel`'s weight. The term sits at 92% of its maximum at S1's
+current error (sigma 0.25 on a squared error scores a 0.1 miss at 0.96) — scaling a saturated
+term scales no gradient. `tracking_precision` instead adds fine companions at sigma **0.02**,
+which carry **2.3–3.2x** the gradient at the operating point, plus a `tracking_heading` term
+because the P-controller's outer loop had no gradient at all and therefore settles at a permanent
+`bias / gain` heading offset for free.
+
+**The trade we are accepting.** The three new terms add **+1.124/step** of positive reward against
+S1's measured net **+0.164/step**, so the penalty terms lose relative pull and the policy is being
+invited to spend smoothness to buy precision. That is intended, but it is exactly how S4 regressed
+(jitter 0.069 → 0.082), so **jitter ≤ 0.035 is a hard promotion gate**, not a nice-to-have. All
+three terms are `exp()` forms bounded in [0, 1], so the unbounded-magnitude failure mode of the
+first v2 ladder cannot recur here.
+
+**Also folded in, because the same measurements exposed them:**
+
+- **Friction has never been below mu 0.5.** `randomize_friction_startup` draws `U[0.5, 1.25]`
+  while `friction_mu0.1` falls in 2.0 s, `mu0.2` drifts 3.3 deg/s and every alpine scenario sits
+  at mu 0.3–0.4. Now `log_uniform[0.08, 1.5]` — log rather than uniform because the interesting
+  decade is the bottom one (~31% of draws below 0.2 against ~8% for uniform). **We had been
+  reading a domain-randomisation hole as a terrain problem.**
+- **Pushes were fixed at 1.0 m/s** while the gate probes 1–4. Now `[2.0, 2.0]` per axis.
+- **Heading episodes almost never start near zero error.** Upstream draws the target from
+  `U(−pi, pi)` independently of current yaw, so an episode begins ~90° off and lives clipped at
+  `heading_clip` — the policy practises *turning* and hardly ever practises *holding a line under
+  disturbance*, which is the behaviour we ship. `hold_prob` 0.5 targets the current heading
+  instead. Stand envs are always hold, and they are now regulated at all: `heading_mode` excluded
+  them, leaving a fifth of every batch with no yaw regulation.
+- `heading_gain` 0.5 → 1.0, halving the steady-state offset.
+
+**Gates to promote T1** (graded on the new `tracking` group plus the existing suite):
+
+| measure | S1 today | T1 must reach |
+| --- | --- | --- |
+| `flat_turn_in_place_1.0` drift | −31.7 deg/s | \|drift\| ≤ 5 |
+| `hold_line_push_right` drift | −15.1 deg/s | \|drift\| ≤ 2 |
+| every `hold_line_*` drift | up to −15.1 | \|drift\| ≤ 1.5 |
+| `hold_line_1.5` lin-vel err | 0.368 | ≤ 0.15 |
+| mean lin-vel err | 0.148 | ≤ 0.10 |
+| `friction_mu0.1` / `mu0.2` | fall / survive | both survive |
+| stability grid | 68/68 | 68/68 |
+| action jitter | 0.032 | ≤ 0.035 |
+
 ## 2026-08-18 — Upper-body skills are a physics disturbance, never an action override (user decision)
 
 **Chosen:** every policy from here on keeps **all 29 action channels**. An upper-body skill is injected as an external disturbance at the actuation/physics level — the policy's arm targets are no longer overwritten in `_pre_physics_step`. The policy owns its arms and must *reject* the skill's motion the way it rejects a push or a payload.

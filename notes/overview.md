@@ -10,10 +10,12 @@ status: current
 
 The Everest terrain itself comes from the sibling repo `C:\Users\Aditya\VSCode\GeologicDome` (footage → LingBot-Map reconstruction → sim terrain). This repo consumes that terrain later through the `TerrainSpec`/`TerrainPatch` interface; it does not reproduce that pipeline.
 
-> [!success] Current phase (2026-08-15)
+> [!success] Current phase (2026-08-18)
 > **Locomotion works.** The first Lambda run (FastSAC, IsaacSim, 4096 envs, 50 k iterations) produced a policy that walks the full command envelope, and it survives the MuJoCo sim2sim gate untuned: **68/68** on the stability grid against a **26/68** PD-stand control, recovering **2–4 m/s** shoves against a 0.2–0.3 m/s floor. Detail and videos: `docs/sim2sim_locomotion_report.md`, `results/videos/showcase/` (start with `02_vs_floor.mp4` — same push, policy vs floor, side by side), or the [summary page](https://claude.ai/code/artifact/c462411d-4103-4789-8ac2-56c37f443b0a).
 >
-> **The final walking policy (v2) is built and ready to launch, not yet trained.** Spec `docs/final_rl_policy.md` → implementation `src/everest_locomotion/holosoma_ext/a3_ultra_loco_v2.py` (six registered stages S0–S4 + an LCP ablation) → launcher `scripts/cloud/train_a3_v2_cloud.sh` (`bash scripts/cloud/train_a3_v2_cloud.sh s1`). All six stages smoke-run and export; the sim2sim harness now reads each policy's observation layout out of its own ONNX metadata and reproduces v1's gate exactly ([[experiments]] 2026-08-15). Also open: the get-up cloud run (E12/E13).
+> **The v2 ladder ran; S1 is promoted and is the policy to build on.** Spec `docs/final_rl_policy.md` → implementation `src/everest_locomotion/holosoma_ext/a3_ultra_loco_v2.py` → launcher `scripts/cloud/train_a3_v2_cloud.sh`. S1 beats v1 on every axis (68/68 grid, 38/41 showcase); S2–S4 each failed their own gate and are not promoted ([[baselines]]).
+>
+> **Next run is T1 — tracking precision.** The goal is a walking policy that goes exactly the speed it is told and holds a straight line under disturbance, before any terrain work. Yaw drift was measured for the first time on 2026-08-18 and it is the weak axis: clean walking is 0.4–1.5 deg/s, but `push_right_1.5` is −9.9, `friction_mu0.1` +15.3, and **S1 turns at ~45% of the commanded rate**. Cause and fix: [[decisions]] 2026-08-18, evidence [[experiments]] E09d, floors [[baselines]]. Launch with `RESUME_FROM=<S1 model_*.pt> bash scripts/cloud/train_a3_v2_cloud.sh t1` (~2.2 GPU-h). Terrain fine-tuning and foot-level heightmap sampling come *after* T1 passes. Also open: the get-up cloud run (E12/E13).
 
 ## Roadmap
 

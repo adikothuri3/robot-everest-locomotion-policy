@@ -25,6 +25,12 @@
 #   s3       + slope terrain, gait quality       -> 230k   ~5.4 h    (continues s2)
 #   s4       + smoothness reward terms           -> 260k   ~1.6 h    (continues s3)
 #   s4-lcp   + Lipschitz penalty (ablation)      -> 260k   ~3-4 h (eager, fp32)
+#   t1       + tracking precision, wide friction ->  90k   ~2.2 h    (continues s1)
+#
+# t1 is NOT part of the s2->s4 arm/terrain ladder — it is the tracking-precision
+# branch off the promoted S1 (docs/final_rl_policy.md is the ladder; the T1
+# rationale lives in notes/decisions.md 2026-08-18). Run it as:
+#   RESUME_FROM=checkpoints/cloud_20260817_043529-a3_ultra_loco_v2_s1-locomotion/model_0045000.pt #     bash scripts/cloud/train_a3_v2_cloud.sh t1
 #
 # S1..S4 SHARE ONE OBSERVATION CONTRACT (692 actor / 707 critic) precisely so
 # that each stage can continue the previous one's weights. `FastSACAgent.load`
@@ -71,8 +77,8 @@ for arg in "${@:-s1}"; do
   case "$arg" in
     all)  STAGES+=(s0 s1 s2 s3 s4) ;;
     rest) STAGES+=(s1 s2 s3 s4) ;;
-    s0|s1|s2|s3|s4|s4-lcp) STAGES+=("$arg") ;;
-    *) echo "unknown stage: $arg (use s0|s1|s2|s3|s4|s4-lcp|all|rest)"; exit 1 ;;
+    s0|s1|s2|s3|s4|s4-lcp|t1) STAGES+=("$arg") ;;
+    *) echo "unknown stage: $arg (use s0|s1|s2|s3|s4|s4-lcp|t1|all|rest)"; exit 1 ;;
   esac
 done
 
@@ -145,6 +151,20 @@ for STAGE in "${STAGES[@]}"; do
   RESUME_ARGS=()
   case "$STAGE" in
     s0|s1) ;;
+    t1)
+      # t1 branches off S1 and MUST resume: its 90k is cumulative on S1's 50k, so
+      # training it cold would run 90k iterations of a config tuned as a 40k
+      # continuation — the exact mistake that made the first S4 undertrained.
+      if [[ -n "$PREV_CKPT" ]]; then
+        RESUME_ARGS=(--training.checkpoint "$PREV_CKPT")
+        echo "     resuming from: $PREV_CKPT"
+      else
+        echo "!! t1 has no checkpoint to continue from. Pass"
+        echo "   RESUME_FROM=<the promoted S1 model_*.pt>."
+        SUMMARY+=("$STAGE  SKIPPED (no checkpoint to resume)")
+        continue
+      fi
+      ;;
     *)
       if [[ -n "$PREV_CKPT" ]]; then
         RESUME_ARGS=(--training.checkpoint "$PREV_CKPT")

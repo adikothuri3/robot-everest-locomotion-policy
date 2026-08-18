@@ -97,7 +97,10 @@ from holosoma.envs.locomotion.locomotion_manager import (  # noqa: E402
 from holosoma.managers.command.base import CommandTermBase  # noqa: E402
 from holosoma.managers.command.terms.locomotion import LocomotionCommand  # noqa: E402
 from holosoma.managers.curriculum.base import CurriculumTermBase  # noqa: E402
-from holosoma.managers.observation.terms.locomotion import base_forward_vector  # noqa: E402
+from holosoma.managers.observation.terms.locomotion import (  # noqa: E402
+    base_forward_vector,
+    get_base_ang_vel,
+)
 from holosoma.utils.rotations import quat_apply, quat_apply_yaw, wrap_to_pi  # noqa: E402
 from holosoma.utils.safe_torch_import import F, nn, optim, torch  # noqa: E402
 from holosoma.utils.torch_utils import torch_rand_float  # noqa: E402
@@ -117,6 +120,15 @@ ARM_DOF_IDX = [
     i for i, n in enumerate(DOF_NAMES) if any(k in n for k in ("shoulder", "elbow", "wrist"))
 ]
 NUM_ARM_DOF = len(ARM_DOF_IDX)  # 14
+
+# The joints that produce yaw. The preset pins every one of them to the default
+# pose (`hip_yaw` 5.0, `waist_yaw` 50.0 -- as hard as the arms) while the joints
+# that produce forward walking are free (`hip_pitch` / `knee` 0.01). Measured
+# consequence: S1 turns at ~45% of the commanded rate (`flat_turn_in_place_1.0`
+# drifts -31.7 deg/s against a commanded 57.3) and cannot correct a disturbance
+# yaw, because the correction is the motion it is most penalised for.
+YAW_DOF_IDX = [i for i, n in enumerate(DOF_NAMES) if n.endswith("hip_yaw_joint")]
+WAIST_YAW_IDX = [i for i, n in enumerate(DOF_NAMES) if n == "waist_yaw_joint"]
 
 # Height scan geometry (component E). 13 x 9 == FastSACConfig.encoder_obs_shape
 # default (1, 13, 9), so CNNActor/CNNCritic need no reshaping changes.
@@ -364,6 +376,22 @@ class A3UltraLocoV2Manager(LeggedRobotLocomotionManager):
 
         self.log_dict["arm_amplitude"] = torch.tensor(float(self.arm_amplitude))
 
+        # Yaw tracking, in the units the failure is actually reported in. Both
+        # existed only as `rew_tracking_ang_vel` before, which S1 showed can move
+        # in the opposite direction to the real error — the reward is an exp() of
+        # a squared error and saturates long before the error is small.
+        #   yaw_drift_dps  — inner loop: |omega - omega_cmd|, deg/s
+        #   heading_err_deg — outer loop: |theta - theta_target| over heading envs
+        cmd_term = self.command_manager.get_state("locomotion_command")
+        cmds = self.command_manager.commands
+        if cmds is not None:
+            drift = (get_base_ang_vel(self)[:, 2] - cmds[:, 2]).abs() * (180.0 / math.pi)
+            self.log_dict["yaw_drift_dps"] = drift.mean().detach().cpu()
+        if isinstance(cmd_term, HeadingLocomotionCommand) and cmd_term.heading_mode is not None:
+            n_heading = cmd_term.heading_mode.sum().clamp(min=1)
+            herr = cmd_term.heading_error().abs().sum() / n_heading
+            self.log_dict["heading_err_deg"] = (herr * (180.0 / math.pi)).detach().cpu()
+
         # Net reward per step, the metric that makes a negative reward budget
         # visible immediately. `only_positive_rewards=False` and
         # `g1_29dof_termination` has no death penalty, so if this goes below zero
@@ -473,6 +501,7 @@ class HeadingLocomotionCommand(LocomotionCommand):
         params = cfg.params or {}
         self.command_dim = 4
         self.heading_prob = float(params.get("heading_prob", 0.8))
+        self.hold_prob = float(params.get("hold_prob", 0.0))
         self.heading_gain = float(params.get("heading_gain", 0.5))
         self.heading_clip = float(params.get("heading_clip", 1.0))
         self.heading_mode: torch.Tensor | None = None
@@ -509,7 +538,23 @@ class HeadingLocomotionCommand(LocomotionCommand):
             if stand.any():
                 commands[env_ids[stand], :3] = 0.0
         self.stand_mode[env_ids] = stand
-        self.heading_mode[env_ids] = (torch.rand(k, device=dev) < self.heading_prob) & ~stand
+        # A standing robot still has a facing to hold. Excluding stand envs left a
+        # fifth of every batch with no yaw regulation at all, and quiet-stand drift
+        # correspondingly untrained.
+        self.heading_mode[env_ids] = torch.rand(k, device=dev) < self.heading_prob
+
+        # "Hold the line": target the heading the robot already has. Upstream draws
+        # the target from U(-pi, pi) independently of current yaw, so a heading
+        # episode begins ~90 deg off and spends most of its life clipped at
+        # `heading_clip` — the policy practises TURNING and almost never practises
+        # holding a line under disturbance, which is the behaviour we ship. Stand
+        # envs are always hold: a standing robot chasing a random target would spin
+        # in place, and the case we want from them is exactly "do not drift".
+        hold = stand.clone()
+        if self.hold_prob > 0.0:
+            hold |= torch.rand(k, device=dev) < self.hold_prob
+        if hold.any():
+            commands[env_ids[hold], 3] = _base_yaw(self.env)[env_ids[hold]]
 
         self._regulate_yaw()
 
@@ -559,6 +604,33 @@ def heading_error(env) -> torch.Tensor:
     if not isinstance(term, HeadingLocomotionCommand) or term.heading_mode is None:
         return torch.zeros(env.num_envs, 1, device=env.device)
     return term.heading_error().unsqueeze(1)
+
+
+# ===========================================================================
+# T · tracking precision — heading regulation reward + two-scale velocity
+# ===========================================================================
+def tracking_heading(env, tracking_sigma: float = 0.05) -> torch.Tensor:
+    """Reward *absolute* heading, not just yaw rate [num_envs].
+
+    S1 regulates yaw through a proportional law (`omega_cmd = k * theta_err`) but
+    rewards only `omega`. A P-controller settles at a steady-state offset of
+    `bias / k`: any residual yaw-rate bias parks the robot permanently off-line at
+    zero reward cost, which is why `flat_walk_fwd_1.0` still drifts and every
+    disturbed scenario drifts much more. This closes the outer loop by giving the
+    heading error its own gradient.
+
+    `sigma` 0.05 puts the 1/e point at ~13 deg of heading error, i.e. the term is
+    flat-ish across a normal turn and steep exactly in the "hold the line" regime.
+
+    Masked to heading-mode envs. A pure yaw-rate episode has no heading target, so
+    scoring it 1.0 would add a constant the policy cannot influence and would make
+    the logged scalar unreadable; it contributes 0 instead.
+    """
+    term = env.command_manager.get_state("locomotion_command")
+    if not isinstance(term, HeadingLocomotionCommand) or term.heading_mode is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    err = term.heading_error()
+    return torch.exp(-err.square() / tracking_sigma) * term.heading_mode.float()
 
 
 # ===========================================================================
@@ -1349,6 +1421,7 @@ class A3UltraFastSACAgent(FastSACAgent):
         env = self.unwrapped_env
         sim_cfg = env.simulator.simulator_config.sim
         gait = env.command_manager.get_state("locomotion_gait")
+        cmd_term = env.command_manager.get_state("locomotion_command")
         groups = []
         for key in self.config.actor_obs_keys:
             groups.append(
@@ -1374,6 +1447,11 @@ class A3UltraFastSACAgent(FastSACAgent):
                 "clip": SCAN_CLIP,
             },
             "arm_dof_indices": ARM_DOF_IDX,
+            "heading": (
+                {"gain": cmd_term.heading_gain, "clip": cmd_term.heading_clip}
+                if isinstance(cmd_term, HeadingLocomotionCommand)
+                else None
+            ),
             "extension": "a3_ultra_loco_v2",
         }
 
@@ -1467,7 +1545,7 @@ def build_observation(
     return ObservationManagerCfg(groups=groups)
 
 
-def _pose_weights(*, arms_free: bool) -> list[float]:
+def _pose_weights(*, arms_free: bool, free_yaw_chain: bool = False) -> list[float]:
     """v1's per-DOF pose weights, with the 14 arm entries optionally softened.
 
     Once **C** lands the arms cannot keep the preset's weight of 50 — the policy
@@ -1479,25 +1557,63 @@ def _pose_weights(*, arms_free: bool) -> list[float]:
     ownership. 5.0 is a tenth of the preset: enough to keep an unowned-by-the-skill
     arm near the default pose, small enough not to fight the CAM reward, which
     deliberately asks for arm swing.
+
+    `free_yaw_chain` additionally releases the joints a turn is made of. The
+    preset weights `hip_yaw` at 5.0 and `waist_yaw` at 50.0 while `hip_pitch` and
+    `knee` sit at 0.01, so going straight is ~500x cheaper than turning. That is
+    the measured cause of S1's yaw deficit (see `YAW_DOF_IDX`). `waist_roll` and
+    `waist_pitch` stay at 50.0 -- torso upright is genuinely wanted -- and the arm
+    weights are untouched, so S1's 28/28 masked arm contract is unaffected.
     """
     weights = list(g1_29dof_loco_fast_sac.terms["pose"].params["pose_weights"])
     if arms_free:
         for i in ARM_DOF_IDX:
             weights[i] = 5.0
+    if free_yaw_chain:
+        for i in YAW_DOF_IDX:
+            weights[i] = 1.0
+        for i in WAIST_YAW_IDX:
+            weights[i] = 1.0
     return weights
 
 
 def build_reward(
     *, arms_free: bool = False, cam: bool = False, smoothness: bool = False,
-    gait_quality: bool = False,
+    gait_quality: bool = False, tracking_precision: bool = False,
+    free_yaw_chain: bool = False,
 ) -> RewardManagerCfg:
     terms = dict(g1_29dof_loco_fast_sac.terms)
     # Ownership-masked `pose` (identical to upstream with no arm command).
     terms["pose"] = replace(
         terms["pose"],
         func=f"{_X}:pose",
-        params={"pose_weights": _pose_weights(arms_free=arms_free)},
+        params={
+            "pose_weights": _pose_weights(
+                arms_free=arms_free, free_yaw_chain=free_yaw_chain
+            )
+        },
     )
+    if tracking_precision:
+        # Two-scale tracking. The preset's sigma of 0.25 on a SQUARED error scores
+        # a 0.1 m/s miss at exp(-0.01/0.25) = 0.96, so the whole good -> perfect
+        # regime lives in the last 4% of the term and there is nothing left to
+        # chase — which is why S1 plateaus at 0.148 m/s. The fine companions use
+        # the same upstream functions at sigma 0.02, where 0.148 scores 0.33 and
+        # 0.05 scores 0.88: real gradient exactly where we are stuck. Bounded in
+        # [0, 1] by construction, so they cannot blow up the reward budget.
+        terms["tracking_lin_vel_fine"] = RewardTermCfg(
+            func=f"{_R}:tracking_lin_vel", weight=1.0,
+            params={"tracking_sigma": 0.02},
+        )
+        terms["tracking_ang_vel_fine"] = RewardTermCfg(
+            func=f"{_R}:tracking_ang_vel", weight=1.0,
+            params={"tracking_sigma": 0.02},
+        )
+        # The outer heading loop, which had no gradient at all until now.
+        terms["tracking_heading"] = RewardTermCfg(
+            func=f"{_X}:tracking_heading", weight=1.0,
+            params={"tracking_sigma": 0.05},
+        )
     if arms_free:
         # The discarded arm channels need a gradient of their own — without this
         # they are unconstrained on 80% of envs and the exported policy's arms are
@@ -1553,7 +1669,8 @@ def build_reward(
 
 
 def build_command(
-    *, heading: bool = False, arm_curriculum: bool = False, lin_vel_x=(-1.0, 1.0)
+    *, heading: bool = False, arm_curriculum: bool = False, lin_vel_x=(-1.0, 1.0),
+    hold_prob: float = 0.0, heading_gain: float = 0.5,
 ) -> CommandManagerCfg:
     loco_func = (
         f"{_X}:HeadingLocomotionCommand"
@@ -1572,7 +1689,14 @@ def build_command(
     if heading:
         # ~20% of episodes stay on pure yaw-rate commands so spin-in-place does
         # not regress (docs/final_rl_policy.md §3A)
-        loco_params.update({"heading_prob": 0.8, "heading_gain": 0.5, "heading_clip": 1.0})
+        loco_params.update(
+            {
+                "heading_prob": 0.8,
+                "heading_gain": heading_gain,
+                "heading_clip": 1.0,
+                "hold_prob": hold_prob,
+            }
+        )
 
     gait = CommandTermCfg(
         func="holosoma.managers.command.terms.locomotion:LocomotionGait",
@@ -1608,6 +1732,48 @@ def build_command(
         reset_terms=reset_terms,
         step_terms=step_terms,
     )
+
+
+def build_randomization(*, wide_friction: bool = False, wide_push: bool = False):
+    """`g1_29dof_randomization` with the two ranges our failures actually live in.
+
+    **Friction.** Upstream draws `U[0.5, 1.25]`, so the policy has literally never
+    seen a surface below mu 0.5 — while `friction_mu0.1` falls in 2.0 s (drifting
+    15.3 deg/s on the way down), `friction_mu0.2` drifts 3.3 deg/s, and every
+    alpine scenario sits at mu 0.3-0.4. We have been reading a domain-randomisation
+    hole as a terrain problem. `log_uniform` rather than `uniform` because the
+    interesting decade is the bottom one: uniform over [0.08, 1.5] would put only
+    ~8% of samples below 0.2, log-uniform puts ~31% there.
+
+    The term draws ONE coefficient per env (the legged_gym convention) and quantises
+    to 64 buckets on the PhysX backends, so widening the range costs nothing.
+
+    **Push.** `max_push_vel` is a 2-vector of per-axis maxima: `_push_robots` draws
+    `U(-1, 1)` per axis and scales by it, so upstream's `[1.0, 1.0]` caps a push at
+    1 m/s while the gate probes 1-4 m/s. Lateral pushes are where the drift is
+    worst (`push_right_1.5` -9.9 deg/s, 2.5x its `push_left` mirror), and they are
+    the half of the envelope furthest outside the trained range. Doubling to
+    `[2.0, 2.0]` puts most of the graded range inside the trained one.
+    """
+    setup = dict(g1_29dof_randomization.setup_terms)
+    if wide_friction:
+        setup["randomize_friction_startup"] = replace(
+            setup["randomize_friction_startup"],
+            params={
+                "friction_range": {"kind": "log_uniform", "low": 0.08, "high": 1.5},
+                "enabled": True,
+            },
+        )
+    if wide_push:
+        setup["push_randomizer_state"] = replace(
+            setup["push_randomizer_state"],
+            params={
+                "push_interval_s": [4, 9],
+                "max_push_vel": [2.0, 2.0],
+                "enabled": True,
+            },
+        )
+    return replace(g1_29dof_randomization, setup_terms=setup)
 
 
 def build_curriculum(*, arm_curriculum: bool = False) -> CurriculumManagerCfg:
@@ -1746,6 +1912,12 @@ def build_experiment(
     smoothness: bool = False,
     gait_quality: bool = False,
     lcp: bool = False,
+    tracking_precision: bool = False,
+    free_yaw_chain: bool = False,
+    wide_friction: bool = False,
+    wide_push: bool = False,
+    hold_prob: float = 0.0,
+    heading_gain: float = 0.5,
     lin_vel_x=(-1.0, 1.0),
     compile_: bool = True,
     buffer_size: int = V2_BUFFER_SIZE,
@@ -1772,9 +1944,12 @@ def build_experiment(
         ),
         action=action.g1_29dof_joint_pos,
         termination=g1_29dof_termination,
-        randomization=g1_29dof_randomization,
+        randomization=build_randomization(
+            wide_friction=wide_friction, wide_push=wide_push
+        ),
         command=build_command(
-            heading=heading, arm_curriculum=arm_curriculum, lin_vel_x=lin_vel_x
+            heading=heading, arm_curriculum=arm_curriculum, lin_vel_x=lin_vel_x,
+            hold_prob=hold_prob, heading_gain=heading_gain,
         ),
         curriculum=build_curriculum(arm_curriculum=arm_curriculum),
         reward=build_reward(
@@ -1782,6 +1957,8 @@ def build_experiment(
             cam=cam,
             smoothness=smoothness,
             gait_quality=gait_quality,
+            tracking_precision=tracking_precision,
+            free_yaw_chain=free_yaw_chain,
         ),
         nightly=NightlyConfig(
             iterations=iterations,
@@ -1904,6 +2081,43 @@ a3_ultra_loco_v2_s4_lcp = EXPERIMENT_REGISTRY.add(
     ),
 )
 
+# ---------------------------------------------------------------------------
+# T1 — tracking precision. Continues **S1** (the promoted policy), same 692/707
+# observation contract, so `--training.checkpoint` loads it directly.
+#
+# Everything here targets the two measured tracking defects and nothing else:
+#
+#   1. S1 turns at ~45% of the commanded rate (`flat_turn_in_place_1.0` sheds
+#      31.7 deg/s against a commanded 57.3) and cannot correct a disturbance yaw
+#      (`push_right_1.5` -9.9 deg/s, `slope_up_10deg` +7.2, `friction_mu0.1`
+#      +15.3) — while clean flat walking is already at 0.4-0.7 deg/s. The cause
+#      is `pose`: every yaw-producing joint is pinned (hip_yaw 5.0, waist_yaw
+#      50.0) and every forward-walking joint is free (hip_pitch/knee 0.01), so a
+#      turn is ~500x more expensive than going straight. -> `free_yaw_chain`
+#   2. The tracking rewards saturate: at sigma 0.25 a 0.1 m/s miss already scores
+#      0.96, so there is no gradient left in the regime we are stuck in.
+#      -> `tracking_precision` (fine companions at sigma 0.02, plus the heading
+#      term that closes the outer loop the P-controller leaves open)
+#
+# Plus the two distribution holes the same measurements exposed: friction has
+# never been below mu 0.5, and heading episodes almost never start near zero
+# error (`hold_prob`). 40k iterations on top of S1's 45k.
+# ---------------------------------------------------------------------------
+a3_ultra_loco_v2_t1 = EXPERIMENT_REGISTRY.add(
+    "a3_ultra_loco_v2_t1",
+    build_experiment(
+        "a3_ultra_loco_v2_t1",
+        iterations=90_000,  # cumulative: S1's 50k + 40k
+        tracking_precision=True,
+        free_yaw_chain=True,
+        wide_friction=True,
+        wide_push=True,
+        hold_prob=0.5,
+        heading_gain=1.0,
+        **_LADDER_OBS,
+    ),
+)
+
 logger.info(
     "a3_ultra_loco_v2 registered: "
     + ", ".join(
@@ -1914,6 +2128,7 @@ logger.info(
             "a3-ultra-loco-v2-s3",
             "a3-ultra-loco-v2-s4",
             "a3-ultra-loco-v2-s4-lcp",
+            "a3-ultra-loco-v2-t1",
         ]
     )
 )
