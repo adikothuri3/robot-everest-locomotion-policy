@@ -36,7 +36,7 @@
 #   bash scripts/cloud/train_a3_v2_cloud.sh t1
 #
 # and if an S1 .pt ever turns up, the same stage continues it instead:
-#   RESUME_FROM=checkpoints/cloud_20260817_043529-a3_ultra_loco_v2_s1-locomotion/model_0045000.pt #     bash scripts/cloud/train_a3_v2_cloud.sh t1
+#   RESUME_FROM=checkpoints/<s1-run>/model_0045000.pt #     bash scripts/cloud/train_a3_v2_cloud.sh t1
 #
 # S1..S4 SHARE ONE OBSERVATION CONTRACT (692 actor / 707 critic) precisely so
 # that each stage can continue the previous one's weights. `FastSACAgent.load`
