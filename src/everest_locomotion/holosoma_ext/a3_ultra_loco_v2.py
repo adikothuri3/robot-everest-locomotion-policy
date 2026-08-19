@@ -2134,17 +2134,68 @@ a3_ultra_loco_v2_s4_lcp = EXPERIMENT_REGISTRY.add(
 # off the floor by ~5k iterations, raise `friction_lo` (it is a parameter for
 # exactly this reason) and relaunch rather than letting the run burn 5 hours.
 # ---------------------------------------------------------------------------
+#: Everything T1 changes relative to S1. T2 reuses it verbatim so the two runs
+#: differ in exactly one variable — the terrain.
+_T1_TRACKING = dict(
+    tracking_precision=True,
+    free_yaw_chain=True,
+    wide_friction=True,
+    wide_push=True,
+    hold_prob=0.5,
+    heading_gain=1.0,
+)
+
 a3_ultra_loco_v2_t1 = EXPERIMENT_REGISTRY.add(
     "a3_ultra_loco_v2_t1",
     build_experiment(
         "a3_ultra_loco_v2_t1",
         iterations=90_000,  # COLD budget (S1 converged by ~45k; this task is harder)
-        tracking_precision=True,
-        free_yaw_chain=True,
-        wide_friction=True,
-        wide_push=True,
-        hold_prob=0.5,
-        heading_gain=1.0,
+        **_T1_TRACKING,
+        **_LADDER_OBS,
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# T2 — T1 on slopes. **One variable: `slopes=True`.** Continues T1's weights, so
+# `iterations` is cumulative (130k = T1's 90k + 40k, ~2.2 h).
+#
+# What actually changes:
+#
+#   terrain  flat .20 / rough .60 / low_obstacles .20 / smooth_slope 0 / rough_slope 0
+#         -> flat .15 / rough .35 / low_obstacles .15 / smooth_slope .20 / rough_slope .15
+#
+# and the spawn gains `query_terrain_height` + `use_grid_sampling`, without which
+# a robot placed on a grade starts interpenetrated and the episode dies before it
+# acts. `max_slope` 0.3 rad (~17 deg) covers the 10-15 deg the gate probes.
+#
+# Two things this is the FIRST run to do:
+#
+#  1. **The height scan finally carries signal.** S1 and T1 both feed a 13x9 scan
+#     into a CNN encoder, but their terrain has no sustained grade — the scan sees
+#     roughness and little else, so the encoder has had nothing to learn from.
+#     A grade is exactly what a forward-looking height map is for.
+#  2. **Every ingredient of the alpine failures is in the training distribution.**
+#     `alpine_combo_hard` is rough d1.0 + 15 deg climb + mu 0.3 + gusts. T1 brought
+#     friction down to mu 0.08 and pushes up to 2 m/s; T2 adds the grade. After
+#     this, what remains untested is the *combination*, not any ingredient — which
+#     is the open question the M4 fine-tune was always going to have to answer.
+#
+# Deliberately NOT included: `gait_quality` (feet air-time + landing impact). Both
+# terms exist and are scale-checked, and they are a reasonable next thing to try on
+# slopes — but bundling them here would cost the single-variable comparison against
+# T1, which is the whole point of running T2 separately instead of folding slopes
+# into T1. Flip `gait_quality=True` for a T3 if T2's landings look harsh.
+#
+# This is the intended HANDOFF artifact for terrain work: a policy that tracks
+# properly (T1), has seen grades and low friction, and ships with a resumable .pt.
+# ---------------------------------------------------------------------------
+a3_ultra_loco_v2_t2 = EXPERIMENT_REGISTRY.add(
+    "a3_ultra_loco_v2_t2",
+    build_experiment(
+        "a3_ultra_loco_v2_t2",
+        iterations=130_000,  # cumulative: T1's 90k + 40k
+        slopes=True,
+        **_T1_TRACKING,
         **_LADDER_OBS,
     ),
 )
@@ -2160,6 +2211,7 @@ logger.info(
             "a3-ultra-loco-v2-s4",
             "a3-ultra-loco-v2-s4-lcp",
             "a3-ultra-loco-v2-t1",
+            "a3-ultra-loco-v2-t2",
         ]
     )
 )

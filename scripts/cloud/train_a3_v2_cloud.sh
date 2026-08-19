@@ -26,6 +26,8 @@
 #   s4       + smoothness reward terms           -> 260k   ~1.6 h    (continues s3)
 #   s4-lcp   + Lipschitz penalty (ablation)      -> 260k   ~3-4 h (eager, fp32)
 #   t1       + tracking precision, wide friction ->  90k   ~4.9 h    (COLD)
+#   t2       + slope terrain                     -> 130k   ~2.2 h    (continues t1)
+#   track    = t1 then t2, ~7 h unattended -- the handoff artifact
 #
 # t1 is NOT part of the s2->s4 arm/terrain ladder — it is the tracking-precision
 # branch off S1 (docs/final_rl_policy.md is the ladder; the T1 rationale lives in
@@ -83,8 +85,9 @@ for arg in "${@:-s1}"; do
   case "$arg" in
     all)  STAGES+=(s0 s1 s2 s3 s4) ;;
     rest) STAGES+=(s1 s2 s3 s4) ;;
-    s0|s1|s2|s3|s4|s4-lcp|t1) STAGES+=("$arg") ;;
-    *) echo "unknown stage: $arg (use s0|s1|s2|s3|s4|s4-lcp|t1|all|rest)"; exit 1 ;;
+    s0|s1|s2|s3|s4|s4-lcp|t1|t2) STAGES+=("$arg") ;;
+    track) STAGES+=(t1 t2) ;;
+    *) echo "unknown stage: $arg (use s0|s1|s2|s3|s4|s4-lcp|t1|t2|track|all|rest)"; exit 1 ;;
   esac
 done
 
@@ -188,6 +191,21 @@ for STAGE in "${STAGES[@]}"; do
         echo "     continuing from: $PREV_CKPT"
       else
         echo "     training from scratch (90k, ~4.9 h) — no S1 .pt available"
+      fi
+      ;;
+    t2)
+      # t2 is t1 + slopes and MUST resume: its 130k is cumulative on t1's 90k, so
+      # cold it would run 130k iterations of a config budgeted as a 40k
+      # continuation. Running `track` (t1 t2) wires this up automatically.
+      if [[ -n "$PREV_CKPT" ]]; then
+        RESUME_ARGS=(--training.checkpoint "$PREV_CKPT")
+        echo "     continuing from: $PREV_CKPT"
+      else
+        echo "!! t2 has no checkpoint to continue from — it would train from"
+        echo "   scratch with a cumulative iteration count and waste the run."
+        echo "   Run 'track' to queue t1 then t2, or pass RESUME_FROM=<t1 model_*.pt>."
+        SUMMARY+=("$STAGE  SKIPPED (no checkpoint to resume)")
+        continue
       fi
       ;;
     *)

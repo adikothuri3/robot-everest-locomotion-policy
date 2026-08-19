@@ -114,6 +114,45 @@ abort rule (in the launcher) is that if `average_episode_length` has not lifted 
 | stability grid | 68/68 | 68/68 |
 | action jitter | 0.032 | ≤ 0.035 |
 
+### T2 — T1 on slopes, and the intended handoff artifact
+
+**Chosen:** a second stage `t2` that continues T1 and changes **exactly one variable**:
+`slopes=True`. 130k cumulative (T1's 90k + 40k, ~2.2 h). `bash scripts/cloud/train_a3_v2_cloud.sh track`
+queues T1 then T2 and wires the checkpoint between them.
+
+Verified single-variable by diffing the two resolved configs: terrain proportions
+(`flat .20/rough .60/low_obstacles .20/slope 0` → `.15/.35/.15/smooth .20/rough .15`) plus the
+spawn's `query_terrain_height`/`use_grid_sampling`, and nothing else.
+
+**Why it is a separate run rather than folded into T1.** Attribution. T1 already entangles the
+base training with the tracking changes because it has to start cold; adding terrain on top would
+leave no way to tell a tracking regression from a terrain one. Slopes are also the *only* thing
+S1's recipe is missing for terrain work — `smooth_slope` and `rough_slope` have been **0.0**
+since v1, so no policy in this project has ever walked on a sustained grade.
+
+**Two firsts:**
+
+1. **The height scan finally carries signal.** S1 and T1 both feed a 13×9 scan through a CNN
+   encoder, but on flat/rough terrain it sees roughness and little else. A grade is what a
+   forward-looking height map is actually for.
+2. **Every *ingredient* of the alpine failures is now in training.** `alpine_combo_hard` is rough
+   d1.0 + 15° climb + mu 0.3 + gusts; T1 brought friction to mu 0.08 and pushes to 2 m/s, T2 adds
+   the grade. What stays untested is the **combination** — which is precisely the open question
+   ([[open-questions]]) the M4 fine-tune was always going to have to answer.
+
+**Deliberately excluded:** `gait_quality` (feet air-time + landing impact). Both terms exist and
+are scale-checked, and they are the obvious next thing to try on slopes — but bundling them costs
+the single-variable comparison that is the entire reason T2 is its own run. `gait_quality=True`
+is a T3 if T2's landings look harsh.
+
+**This is what gets handed to the terrain partner:** T2's **`.pt` and `.onnx`**, plus
+[[baselines]] and the `tracking` scenario group as their gate. Not S1 — S1 has no `.pt`, has
+never seen a grade, under-turns by ~55% and has never been below mu 0.5, so its failures would
+show up as *their* terrain problems. **Freeze the observation contract jointly before either side
+trains:** the trainer has no padding path for a widened observation, so two people adding terms
+independently produces two mutually unresumable checkpoints. That is what turned the first v2
+ladder into four unrelated cold runs.
+
 ## 2026-08-18 — Upper-body skills are a physics disturbance, never an action override (user decision)
 
 **Chosen:** every policy from here on keeps **all 29 action channels**. An upper-body skill is injected as an external disturbance at the actuation/physics level — the policy's arm targets are no longer overwritten in `_pre_physics_step`. The policy owns its arms and must *reject* the skill's motion the way it rejects a push or a payload.
