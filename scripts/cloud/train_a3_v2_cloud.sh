@@ -135,6 +135,28 @@ SUMMARY=()
 #     bash scripts/cloud/train_a3_v2_cloud.sh s2 s3 s4
 PREV_CKPT="${RESUME_FROM:-}"
 
+# Fail here, not four hours in. `FastSACAgent.load` needs the TRAINING checkpoint
+# (.pt: actor, critic, both optimizers, log_alpha, both observation normalizers
+# and global_step). A .onnx is an inference export and carries none of that, so
+# passing one either errors on load or — worse — is ignored and the stage trains
+# from scratch with a cumulative iteration count.
+#
+# Note that only .onnx files were ever pulled off the v2 instances: every
+# checkpoints/cloud_2026081[5-7]_* directory here is ONNX-only. If you need to
+# resume one of those stages, the .pt has to come off the Lambda box first.
+if [[ -n "$PREV_CKPT" ]]; then
+  case "$PREV_CKPT" in
+    *.pt) ;;
+    *) echo "ERROR: RESUME_FROM must be a training checkpoint (.pt), got: $PREV_CKPT"
+       echo "       A .onnx is an inference export — it cannot seed a resumed run."
+       exit 1 ;;
+  esac
+  if [[ ! -f "$PREV_CKPT" ]]; then
+    echo "ERROR: RESUME_FROM does not exist: $PREV_CKPT"
+    exit 1
+  fi
+fi
+
 for STAGE in "${STAGES[@]}"; do
   EXP="a3-ultra-loco-v2-${STAGE}"
   echo
