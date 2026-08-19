@@ -1734,7 +1734,10 @@ def build_command(
     )
 
 
-def build_randomization(*, wide_friction: bool = False, wide_push: bool = False):
+def build_randomization(
+    *, wide_friction: bool = False, wide_push: bool = False,
+    friction_lo: float = 0.08, friction_hi: float = 1.5,
+):
     """`g1_29dof_randomization` with the two ranges our failures actually live in.
 
     **Friction.** Upstream draws `U[0.5, 1.25]`, so the policy has literally never
@@ -1760,7 +1763,9 @@ def build_randomization(*, wide_friction: bool = False, wide_push: bool = False)
         setup["randomize_friction_startup"] = replace(
             setup["randomize_friction_startup"],
             params={
-                "friction_range": {"kind": "log_uniform", "low": 0.08, "high": 1.5},
+                "friction_range": {
+                    "kind": "log_uniform", "low": friction_lo, "high": friction_hi,
+                },
                 "enabled": True,
             },
         )
@@ -1916,6 +1921,8 @@ def build_experiment(
     free_yaw_chain: bool = False,
     wide_friction: bool = False,
     wide_push: bool = False,
+    friction_lo: float = 0.08,
+    friction_hi: float = 1.5,
     hold_prob: float = 0.0,
     heading_gain: float = 0.5,
     lin_vel_x=(-1.0, 1.0),
@@ -1945,7 +1952,8 @@ def build_experiment(
         action=action.g1_29dof_joint_pos,
         termination=g1_29dof_termination,
         randomization=build_randomization(
-            wide_friction=wide_friction, wide_push=wide_push
+            wide_friction=wide_friction, wide_push=wide_push,
+            friction_lo=friction_lo, friction_hi=friction_hi,
         ),
         command=build_command(
             heading=heading, arm_curriculum=arm_curriculum, lin_vel_x=lin_vel_x,
@@ -2082,8 +2090,17 @@ a3_ultra_loco_v2_s4_lcp = EXPERIMENT_REGISTRY.add(
 )
 
 # ---------------------------------------------------------------------------
-# T1 — tracking precision. Continues **S1** (the promoted policy), same 692/707
-# observation contract, so `--training.checkpoint` loads it directly.
+# T1 — tracking precision. Trains **from scratch** at S1's 692/707 observation
+# contract.
+#
+# It was designed to continue S1 (~2.2 GPU-h) and it still can, if an S1 `.pt`
+# ever turns up: the observation contract is unchanged, so `--training.checkpoint`
+# would load it directly. It cannot today — only `.onnx` was pulled off the v2
+# cloud runs and the instance is gone, and an ONNX carries none of what
+# `FastSACAgent.load` needs (critic, optimizers, log_alpha, normalizers,
+# global_step). So 90k is a COLD budget, not a cumulative one: S1 converged by
+# ~45k, and the objective here is strictly harder (tighter tracking targets, a
+# friction range extended by half a decade, double the push magnitude).
 #
 # Everything here targets the two measured tracking defects and nothing else:
 #
@@ -2101,13 +2118,27 @@ a3_ultra_loco_v2_s4_lcp = EXPERIMENT_REGISTRY.add(
 #
 # Plus the two distribution holes the same measurements exposed: friction has
 # never been below mu 0.5, and heading episodes almost never start near zero
-# error (`hold_prob`). 40k iterations on top of S1's 45k.
+# error (`hold_prob`).
+#
+# STABILITY NOTE. Everything that earned S1 its 68/68 is untouched here — the
+# observation set, the velocity estimator, 5-frame history, symmetry, the terrain
+# mix, the termination set and the penalty curriculum all carry over unchanged.
+# The only reward weights that move are the yaw chain's, and the only additions
+# are bounded [0, 1] tracking terms. The widened friction and push ranges make
+# the training distribution strictly harder than the graded one, which is the
+# direction that buys robustness rather than spending it.
+#
+# The one cold-start risk is friction: ~31% of envs draw below mu 0.2 from step 0,
+# and an untrained policy on near-frictionless ground cannot get traction. The
+# other ~69% carry early learning, but if `average_episode_length` has not lifted
+# off the floor by ~5k iterations, raise `friction_lo` (it is a parameter for
+# exactly this reason) and relaunch rather than letting the run burn 5 hours.
 # ---------------------------------------------------------------------------
 a3_ultra_loco_v2_t1 = EXPERIMENT_REGISTRY.add(
     "a3_ultra_loco_v2_t1",
     build_experiment(
         "a3_ultra_loco_v2_t1",
-        iterations=90_000,  # cumulative: S1's 50k + 40k
+        iterations=90_000,  # COLD budget (S1 converged by ~45k; this task is harder)
         tracking_precision=True,
         free_yaw_chain=True,
         wide_friction=True,

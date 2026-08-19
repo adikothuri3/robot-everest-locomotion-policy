@@ -10,10 +10,17 @@ Newest first. Each entry: what was chosen, why, what was rejected. Add an entry 
 
 ## 2026-08-18 — Yaw tracking is a reward-shape bug, not a heading-observation bug (T1)
 
-**Chosen:** branch **T1** off the promoted S1 — same 692/707 observation contract, resumed by
-`--training.checkpoint`, 40k additional iterations — carrying five changes and nothing else:
-`free_yaw_chain`, `tracking_precision`, `wide_friction`, `wide_push`, `hold_prob`. Run it with
-`RESUME_FROM=<S1 model_*.pt> bash scripts/cloud/train_a3_v2_cloud.sh t1`.
+**Chosen:** branch **T1** off S1's recipe — same 692/707 observation contract — carrying five
+changes and nothing else: `free_yaw_chain`, `tracking_precision`, `wide_friction`, `wide_push`,
+`hold_prob`. Run it with `bash scripts/cloud/train_a3_v2_cloud.sh t1`.
+
+> [!warning] It trains **cold** (90k, ~4.9 GPU-h), not as a 40k continuation
+> The design was to continue S1 in ~2.2 h, and the contract is unchanged so it still would.
+> But only `.onnx` was pulled off every v2 cloud run and **the instance is gone** — an ONNX
+> carries none of what `FastSACAgent.load` needs. 90k is therefore a cold budget: S1 converged
+> by ~45k and this objective is strictly harder. The cost is attribution — S1-vs-T1 is no longer
+> a clean single-variable comparison, because the base training and the tracking changes are
+> entangled in one run. Grade T1 against S1's recorded numbers in [[baselines]] instead.
 
 **What the measurement showed.** `RolloutResult.heading_drift_deg` had been computed since the
 first sim2sim run and reported *nowhere* — not printed, not summarised, not gated. Reading it out
@@ -79,6 +86,20 @@ first v2 ladder cannot recur here.
   instead. Stand envs are always hold, and they are now regulated at all: `heading_mode` excluded
   them, leaving a fifth of every batch with no yaw regulation.
 - `heading_gain` 0.5 → 1.0, halving the steady-state offset.
+
+**Stability, since it is the other half of the ask.** Everything that earned S1 its 68/68 is
+untouched: the observation set, the velocity estimator, 5-frame history, symmetry, the terrain
+mix, the termination set, the penalty curriculum. The only reward weights that move are the yaw
+chain's; the only additions are bounded `[0, 1]` tracking terms. Widening friction and pushes
+makes the *training* distribution strictly harder than the *graded* one, which is the direction
+that buys robustness. No death penalty was added — the new positive reward keeps the budget
+comfortably positive, and an untested term in a single 5-hour cold run is the risk this project
+has already paid for twice.
+
+The one cold-start risk is friction: ~31% of envs draw below mu 0.2 from step 0 and an untrained
+policy cannot get traction there. `friction_lo` is a parameter for exactly this reason — the
+abort rule (in the launcher) is that if `average_episode_length` has not lifted off the floor by
+~5k iterations, raise it and relaunch rather than burn the run.
 
 **Gates to promote T1** (graded on the new `tracking` group plus the existing suite):
 

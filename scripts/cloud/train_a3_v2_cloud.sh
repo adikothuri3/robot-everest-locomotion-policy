@@ -25,11 +25,17 @@
 #   s3       + slope terrain, gait quality       -> 230k   ~5.4 h    (continues s2)
 #   s4       + smoothness reward terms           -> 260k   ~1.6 h    (continues s3)
 #   s4-lcp   + Lipschitz penalty (ablation)      -> 260k   ~3-4 h (eager, fp32)
-#   t1       + tracking precision, wide friction ->  90k   ~2.2 h    (continues s1)
+#   t1       + tracking precision, wide friction ->  90k   ~4.9 h    (COLD)
 #
 # t1 is NOT part of the s2->s4 arm/terrain ladder — it is the tracking-precision
-# branch off the promoted S1 (docs/final_rl_policy.md is the ladder; the T1
-# rationale lives in notes/decisions.md 2026-08-18). Run it as:
+# branch off S1 (docs/final_rl_policy.md is the ladder; the T1 rationale lives in
+# notes/decisions.md 2026-08-18). It was meant to continue S1 in ~2.2 h, but only
+# .onnx was pulled off the v2 runs and the instance is gone, so its 90k is a cold
+# budget. Run it as:
+#
+#   bash scripts/cloud/train_a3_v2_cloud.sh t1
+#
+# and if an S1 .pt ever turns up, the same stage continues it instead:
 #   RESUME_FROM=checkpoints/cloud_20260817_043529-a3_ultra_loco_v2_s1-locomotion/model_0045000.pt #     bash scripts/cloud/train_a3_v2_cloud.sh t1
 #
 # S1..S4 SHARE ONE OBSERVATION CONTRACT (692 actor / 707 critic) precisely so
@@ -174,17 +180,14 @@ for STAGE in "${STAGES[@]}"; do
   case "$STAGE" in
     s0|s1) ;;
     t1)
-      # t1 branches off S1 and MUST resume: its 90k is cumulative on S1's 50k, so
-      # training it cold would run 90k iterations of a config tuned as a 40k
-      # continuation — the exact mistake that made the first S4 undertrained.
+      # t1's 90k is a COLD budget, so it runs with or without a checkpoint. It
+      # will happily continue an S1 `.pt` if one ever turns up (same 692/707
+      # contract) — that just makes it finish sooner.
       if [[ -n "$PREV_CKPT" ]]; then
         RESUME_ARGS=(--training.checkpoint "$PREV_CKPT")
-        echo "     resuming from: $PREV_CKPT"
+        echo "     continuing from: $PREV_CKPT"
       else
-        echo "!! t1 has no checkpoint to continue from. Pass"
-        echo "   RESUME_FROM=<the promoted S1 model_*.pt>."
-        SUMMARY+=("$STAGE  SKIPPED (no checkpoint to resume)")
-        continue
+        echo "     training from scratch (90k, ~4.9 h) — no S1 .pt available"
       fi
       ;;
     *)
@@ -232,10 +235,28 @@ for STAGE in "${STAGES[@]}"; do
   fi
   OUT="$REPO_DIR/checkpoints/cloud_$(basename "$RUN_DIR")"
   mkdir -p "$OUT"
-  cp "$RUN_DIR"/model_*.pt "$RUN_DIR"/model_*.onnx "$RUN_DIR"/holosoma_config.yaml "$OUT"/ 2>/dev/null || true
+  cp "$RUN_DIR"/model_*.onnx "$RUN_DIR"/holosoma_config.yaml "$OUT"/ 2>/dev/null || true
   cp "$RUN_DIR"/events.out.tfevents.* "$OUT"/ 2>/dev/null || true
+
+  # The .pt files are the ONLY resumable artifact and they are what went missing
+  # from every v2 run: the whole ladder was pulled down as ONNX, which cannot
+  # seed a continuation, and by the time that was noticed the instance was gone.
+  # Copy them loudly and count them — never `2>/dev/null || true`.
+  N_PT=0
+  if compgen -G "$RUN_DIR/model_*.pt" >/dev/null; then
+    cp "$RUN_DIR"/model_*.pt "$OUT"/
+    N_PT=$(find "$OUT" -maxdepth 1 -name 'model_*.pt' | wc -l)
+  fi
+  N_ONNX=$(find "$OUT" -maxdepth 1 -name 'model_*.onnx' | wc -l)
   echo "$COMMIT_SHA" > "$OUT/CODE_COMMIT"
-  echo "artifacts in: $OUT"
+  echo "artifacts in: $OUT  ($N_PT .pt, $N_ONNX .onnx, $(du -sh "$OUT" | cut -f1))"
+  if [[ "$N_PT" -eq 0 ]]; then
+    echo "!! NO .pt CHECKPOINTS COLLECTED for $EXP — this run cannot ever be resumed."
+    echo "   Do not tear down this instance until you know why."
+    SUMMARY+=("$STAGE  ok BUT NO .pt (unresumable) -> checkpoints/$(basename "$OUT")")
+  else
+    SUMMARY+=("$STAGE  ok ($N_PT .pt) -> checkpoints/$(basename "$OUT")")
+  fi
 
   # hand the highest-iteration checkpoint to the next stage (sort -V so
   # model_0100000 beats model_0090000 instead of losing on string order)
@@ -246,7 +267,6 @@ for STAGE in "${STAGES[@]}"; do
     echo "!! no .pt produced by $EXP — the next stage will have nothing to resume"
     PREV_CKPT=""
   fi
-  SUMMARY+=("$STAGE  ok -> checkpoints/$(basename "$OUT")")
 done
 
 echo
@@ -256,8 +276,19 @@ echo "==========================================================================
 
 cat <<EOF
 
-Retrieve locally:
+Retrieve locally -- PULL THE .pt FILES. They are the only resumable artifact,
+they are ~20-30 MB each (a whole run is a few hundred MB), and every v2 run
+before this one was pulled as ONNX only. That cost a 2 h continuation and forced
+a 5 h cold retrain once the instance was gone.
+
   scp -r ubuntu@<instance>:$REPO_DIR/checkpoints/cloud_* ./checkpoints/
+
+Then VERIFY before you tear the instance down -- this is the whole lesson:
+
+  ls checkpoints/cloud_*/model_*.pt | wc -l     # must be > 0
+  du -sh checkpoints/cloud_*/                   # ONNX-only dirs are suspiciously small
+
+If that count is 0, the .pt files exist only on the box. Do not terminate it.
 
 Then grade (docs/final_rl_policy.md §7) — the harness reads each policy's
 observation layout out of its own ONNX metadata, so no harness flags change
@@ -271,9 +302,23 @@ between stages:
   python scripts/eval/sim2sim_arms.py  --onnx \$P --mask-arm-obs      # ablation
 
 Watch these scalars in TensorBoard/W&B while a stage runs:
+  ALL  Env/net_reward_per_step   must stay POSITIVE. If it goes negative, falling
+                              early becomes optimal (there is no death penalty)
+                              and episode length decays behind it. This is how
+                              S2/S3/S4 burned 14 GPU-h while looking healthy.
+  ALL  average_episode_length must climb toward the 1000 cap and stay there.
+                              t1 abort rule: if it has not lifted off the floor by
+                              ~5k iterations, the friction floor is too low for a
+                              cold start — relaunch with a higher friction_lo
+                              rather than letting it burn 5 hours.
+  t1   Env/yaw_drift_dps      the number t1 exists to fix. Must fall.
+  t1   Env/heading_err_deg    residual heading error over heading-mode envs.
+  t1   Episode/rew_tracking_lin_vel_fine, _ang_vel_fine, rew_tracking_heading
+                              the precision terms, each bounded [0, 1]. They
+                              should RISE. Flat near 0 means the fine sigma is too
+                              tight to give gradient; pinned near 1 means too loose.
   s1+  vel_est_rms_ms         must fall and stay low. A confidently wrong
                               estimate is worse than no estimate — this gates s1.
-  s1+  Episode/rew_tracking_ang_vel   >= 0.8 (v1 finished at 0.559)
   s2+  Env/arm_amplitude      must WIDEN past 0.25. If it stalls, standing still
                               became the cheaper policy (docs/final_rl_policy.md §8).
   s2+  Env/cam_z, Env/cam_xy  sanity-check the CAM scale before trusting
